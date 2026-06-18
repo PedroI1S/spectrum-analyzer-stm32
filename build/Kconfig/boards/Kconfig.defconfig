@@ -1,0 +1,2 @@
+# Load Zephyr board defconfig descriptions.
+osource "/home/rodrigo/my-workspace/example-application/boards/vendor/custom_plank/Kconfig.defconfig"
