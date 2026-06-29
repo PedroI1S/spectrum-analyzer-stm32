@@ -1,4 +1,64 @@
-# Zephyr Example Application
+# Analisador de Espectro de Áudio em Tempo Real (Zephyr / STM32F4-Discovery)
+
+Trabalho final de Sistemas de Tempo Real. Captura áudio por microfone I2S, calcula a
+FFT em tempo real e exibe o espectro num display OLED, de forma autônoma. O plano
+completo está em [`plano_projeto_analisador_espectro_zephyr.md`](plano_projeto_analisador_espectro_zephyr.md).
+
+> Este repositório partiu do template **Zephyr example-application**; a documentação
+> original do template está preservada [mais abaixo](#zephyr-example-application-template-original).
+
+## Estado atual (bring-up — atualizado em 27/06/2026)
+
+- ✅ Ambiente Zephyr montado: venv (`.venv/`), `west`, Zephyr `main` + módulos
+  (`cmsis_6`, `hal_stm32`, `hal_nordic`, `segger`) e toolchain `arm-zephyr-eabi`.
+  Ferramentas de host via Homebrew: `openocd`, `stlink`, `dtc`.
+- ✅ Comunicação com a placa via ST-LINK/OpenOCD (STM32F407VG detectado).
+- ✅ `blinky` gravado e validado (LED pisca).
+- ✅ Console por **SEGGER RTT** sobre o ST-LINK (sem adaptador USB-serial).
+- ✅ `app/` compila e roda na `stm32f4_disco` (usa os aliases `led0`/`sw0` da placa).
+- ✅ **F0 concluído** — esqueleto de tempo real (plano §4) implementado e validado na placa:
+  threads `acq_fft` (hard) e `display` (soft) com semáforo + message queue, `blink` por
+  `k_timer`, botão por IRQ→work queue, e shell por RTT com `kernel thread list`, `kernel stacks`
+  e os comandos `rt status` / `rt mode <spectrum|wave|stats>`. acq_fft/display rodam com
+  espectro sintético (stubs marcados `TODO(Fx)`) até o circuito existir.
+- ⏳ Próximo (F1+): display SSD1306 no I2C1, depois aquisição I2S do INMP441 + FFT (CMSIS-DSP). Ver §11 e §15 do plano.
+
+## Como construir, gravar e ver o console
+
+A partir da raiz deste repositório (`Zephyr-Project/`) — o `west` encontra o workspace
+sozinho subindo até o `.west/` na pasta-pai:
+
+```shell
+source .venv/bin/activate                # ativa o ambiente Python
+west build -b stm32f4_disco app          # compila o app (gera ./build)
+west flash -d build --runner openocd     # grava (forca o runner openocd)
+./scripts/rtt-console.sh                 # abre o terminal RTT interativo (porta 9090)
+```
+
+Notas:
+
+- O **runner padrão** do board é o STM32CubeProgrammer (não instalado) — sempre passe
+  `--runner openocd`.
+- O `app/prj.conf` usa o **shell por RTT** (`CONFIG_SHELL_BACKEND_RTT=y`,
+  `CONFIG_SHELL_BACKEND_SERIAL=n`); os logs saem pelo mesmo backend. O `rtt-console.sh`
+  abre um terminal interativo — dá para digitar comandos do shell direto nele.
+- **Só um OpenOCD por vez** segura o ST-LINK — encerre o servidor RTT (Ctrl-C no script)
+  antes de gravar.
+
+### Recriar o ambiente do zero (outra máquina)
+
+```shell
+brew install openocd stlink dtc cmake ninja gperf
+python3 -m venv Zephyr-Project/.venv && source Zephyr-Project/.venv/bin/activate
+pip install west
+west init -l Zephyr-Project && west update
+west zephyr-export && pip install -r zephyr/scripts/requirements.txt
+west sdk install -t arm-zephyr-eabi
+```
+
+---
+
+# Zephyr Example Application (template original)
 
 <a href="https://github.com/zephyrproject-rtos/example-application/actions/workflows/build.yml?query=branch%3Amain">
   <img src="https://github.com/zephyrproject-rtos/example-application/actions/workflows/build.yml/badge.svg?event=push">
