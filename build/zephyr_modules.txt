@@ -1,4 +1,0 @@
-"example-application":"/home/rodrigo/my-workspace/example-application":"/home/rodrigo/my-workspace/example-application"
-"cmsis_6":"/home/rodrigo/my-workspace/modules/hal/cmsis_6":"${ZEPHYR_CMSIS_6_CMAKE_DIR}"
-"hal_nordic":"/home/rodrigo/my-workspace/modules/hal/nordic":"${ZEPHYR_HAL_NORDIC_CMAKE_DIR}"
-"hal_stm32":"/home/rodrigo/my-workspace/modules/hal/stm32":"/home/rodrigo/my-workspace/modules/hal/stm32"

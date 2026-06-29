@@ -1,0 +1,10 @@
+# Saida de build do Zephyr/west
+/build/
+build/
+
+# Ambiente virtual Python
+/.venv/
+
+# Caches Python
+__pycache__/
+*.pyc
