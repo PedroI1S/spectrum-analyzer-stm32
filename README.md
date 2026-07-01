@@ -21,7 +21,8 @@ completo está em [`plano_projeto_analisador_espectro_zephyr.md`](plano_projeto_
   `k_timer`, botão por IRQ→work queue, e shell por RTT com `kernel thread list`, `kernel stacks`
   e os comandos `rt status` / `rt mode <spectrum|wave|stats>`. acq_fft/display rodam com
   espectro sintético (stubs marcados `TODO(Fx)`) até o circuito existir.
-- ⏳ Próximo (F1+): display SSD1306 no I2C1, depois aquisição I2S do INMP441 + FFT (CMSIS-DSP). Ver §11 e §15 do plano.
+- ✅ **F1 concluído** — display OLED SSD1306 (I2C1 @ 0x3c) funcionando; mostra f0/modo/fps via CFB. Console RTT limpo + comandos `rt watch [s]` e `rt help`.
+- ⏳ Próximo (F2): aquisição I2S do INMP441 (mic) — detector de nota/afinador por autocorrelação e, depois, FFT (CMSIS-DSP). Ver §11 e §15 do plano.
 
 ## Como construir, gravar e ver o console
 

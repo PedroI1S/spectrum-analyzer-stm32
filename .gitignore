@@ -5,6 +5,7 @@ build/
 # Ambiente virtual Python
 /.venv/
 
-# Caches Python
+# Caches (Python, clangd/ferramentas)
 __pycache__/
 *.pyc
+.cache/

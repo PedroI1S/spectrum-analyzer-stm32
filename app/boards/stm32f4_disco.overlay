@@ -4,16 +4,35 @@
  *
  * Overlay da STM32F4-Discovery (STM32F407VG) para o analisador de espectro.
  *
- * Fase F0 (esqueleto RT): nao precisa de nada aqui - o app usa os aliases que
- * a propria placa ja fornece: led0 = LED verde LD4 (PD12) e sw0 = botao B1 (PA0).
+ * Fase F1: display OLED SSD1306 (128x64, I2C) no I2C1.
+ *   O barramento I2C1 (SCL=PB6, SDA=PB9) ja vem habilitado pelo board, com
+ *   pull-ups. O codec de audio CS43L22 (0x4a) compartilha esse barramento -
+ *   sem conflito, pois os enderecos sao distintos (OLED = 0x3c).
  *
- * A partir da F1/F2 este overlay recebe os perifericos do circuito (ver
- * plano_projeto_analisador_espectro_zephyr.md, §3 e §7.3):
- *
- *   - Display OLED SSD1306 no I2C1 (SCL=PB6, SDA=PB7, addr 0x3C) + chosen
- *     zephyr,display;
- *   - Microfone INMP441 no I2S2 (CK=PB13, WS=PB12, SD=PB15) + clock PLLI2S e
- *     canal de DMA RX;
- *
- * (pinos sao a proposta do plano - confirmar no esquematico antes de soldar).
+ * Fase F2 (a fazer): microfone INMP441 no I2S2 (CK=PB13, WS=PB12, SD=PB15).
+ *   Como PB13 e usado pelo CAN2 no board, sera preciso desabilita-lo aqui:
+ *     &can2 { status = "disabled"; };
+ *   e habilitar &i2s2 com o clock PLLI2S e o canal de DMA RX.
  */
+
+&i2c1 {
+	ssd1306: ssd1306@3c {
+		compatible = "solomon,ssd1306";
+		reg = <0x3c>;
+		width = <128>;
+		height = <64>;
+		segment-offset = <0>;
+		page-offset = <0>;
+		display-offset = <0>;
+		multiplex-ratio = <63>;
+		segment-remap;
+		com-invdir;
+		prechargep = <0x22>;
+	};
+};
+
+/ {
+	chosen {
+		zephyr,display = &ssd1306;
+	};
+};
