@@ -35,6 +35,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <arm_math.h>
 
 LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
 
@@ -76,6 +77,13 @@ LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
 static const char *const note_names[12] = {
 	"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
 };
+
+/* ===== Espectro (FFT real de 512 pontos, CMSIS-DSP) =====
+ * Magnitudes em dB mapeadas para barras de 0..63; bandas em progressao
+ * geometrica (log) - audio e logaritmico nos dois eixos. */
+#define SPEC_BINS      (FFT_SIZE / 2)
+#define SPEC_DB_FLOOR  80.0f     /* dB que zera a barra (piso ~ ruido) */
+#define SPEC_DB_TOP    175.0f    /* dB que satura a barra (fundo de escala) */
 
 /* ===== Modos de exibicao (plano, secao 8 + modo afinador) ===== */
 enum disp_mode { MODE_TUNER = 0, MODE_SPECTRUM, MODE_WAVE, MODE_STATS, MODE_COUNT };
@@ -250,6 +258,69 @@ static void tuner_note(float f0, uint8_t *midi, int16_t *cents)
 	*cents = (int16_t)lroundf(c_a4 - 100.0f * (float)n);
 }
 
+/* ===== FFT do espectro (CMSIS-DSP) ===== */
+static arm_rfft_fast_instance_f32 rfft;
+static float hann[FFT_SIZE];
+static float fft_in[FFT_SIZE];
+static float fft_out[FFT_SIZE];
+static float fft_mag[SPEC_BINS];
+static uint16_t band_edge[N_BARS + 1];   /* limites (bins) das barras, escala log */
+
+static void spectrum_init(void)
+{
+	arm_rfft_fast_init_f32(&rfft, FFT_SIZE);
+	for (int i = 0; i < FFT_SIZE; i++) {
+		hann[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (FFT_SIZE - 1)));
+	}
+	/* bandas: progressao geometrica do bin 1 ao SPEC_BINS */
+	band_edge[0] = 1;
+	for (int b = 1; b <= N_BARS; b++) {
+		uint16_t e = (uint16_t)lroundf(
+			powf((float)SPEC_BINS, (float)b / N_BARS));
+
+		band_edge[b] = MAX(e, band_edge[b - 1] + 1); /* >=1 bin por banda */
+	}
+	band_edge[N_BARS] = SPEC_BINS;
+}
+
+/* FFT sobre as ultimas FFT_SIZE amostras do anel; preenche f->bars e retorna
+ * a frequencia do bin dominante (Hz) */
+static uint16_t spectrum_compute(struct spectrum_frame *f)
+{
+	/* lineariza as FFT_SIZE amostras mais recentes com janela de Hann */
+	uint32_t start = (tuner_pos - FFT_SIZE) & (TUNER_WIN - 1);
+
+	for (int i = 0; i < FFT_SIZE; i++) {
+		fft_in[i] = tuner_ring[(start + i) & (TUNER_WIN - 1)] * hann[i];
+	}
+
+	arm_rfft_fast_f32(&rfft, fft_in, fft_out, 0);
+	arm_cmplx_mag_f32(fft_out, fft_mag, SPEC_BINS);
+	fft_mag[0] = 0.0f;                       /* descarta DC */
+
+	/* barras: maximo da banda -> dB -> 0..63 */
+	uint32_t dom_bin = 1;
+
+	for (int b = 0; b < N_BARS; b++) {
+		float m = 0.0f;
+
+		for (int k = band_edge[b]; k < band_edge[b + 1]; k++) {
+			if (fft_mag[k] > m) {
+				m = fft_mag[k];
+			}
+			if (fft_mag[k] > fft_mag[dom_bin]) {
+				dom_bin = k;
+			}
+		}
+		float db = 20.0f * log10f(m + 1.0f);
+		int h = (int)((db - SPEC_DB_FLOOR) *
+			      (63.0f / (SPEC_DB_TOP - SPEC_DB_FLOOR)));
+
+		f->bars[b] = (uint8_t)CLAMP(h, 0, 63);
+	}
+	return (uint16_t)lroundf((float)dom_bin * FS_ACTUAL_HZ / FFT_SIZE);
+}
+
 /* ===== acq_fft (hard RT) - le o I2S via DMA, processa e publica =====
  * O i2s_read bloqueia ate o DMA entregar um bloco: e o proprio relogio
  * hard RT da aquisicao (sem polling). */
@@ -268,6 +339,8 @@ static void acq_fft_thread(void *a, void *b, void *c)
 	uint32_t seq = 0;
 
 	int rc;
+
+	spectrum_init();
 
 	if (!device_is_ready(i2s_dev)) {
 		rt.i2s_err = -ENODEV;
@@ -342,13 +415,12 @@ static void acq_fft_thread(void *a, void *b, void *c)
 		rt.level = (uint32_t)peak;
 
 		struct spectrum_frame f = { .seq = seq };
-		uint8_t h = peak >> 17;            /* escala grosseira p/ VU 0..63 */
 
-		if (h > 63) {
-			h = 63;
-		}
-		for (int i = 0; i < N_BARS; i++) {
-			f.bars[i] = h;
+		/* espectro: FFT das ultimas FFT_SIZE amostras (barras em dB) */
+		uint16_t spec_dom_hz = 0;
+
+		if (tuner_fill >= FFT_SIZE) {
+			spec_dom_hz = spectrum_compute(&f);
 		}
 
 		/* afinador: so tenta detectar com janela cheia e nivel suficiente */
@@ -358,10 +430,13 @@ static void acq_fft_thread(void *a, void *b, void *c)
 			if (f0 > 0.0f) {
 				tuner_note(f0, &f.midi, &f.cents);
 				f.f0_dhz = (uint16_t)lroundf(f0 * 10.0f);
-				f.dominant_hz = (uint16_t)lroundf(f0);
 				f.note_valid = 1;
 			}
 		}
+		/* freq dominante: a do afinador (mais precisa) se ha nota;
+		 * senao, o bin dominante da FFT */
+		f.dominant_hz = f.note_valid ? (uint16_t)((f.f0_dhz + 5) / 10)
+					     : spec_dom_hz;
 		rt.dominant_hz = f.dominant_hz;
 
 		rt.fft_us_last = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
@@ -416,9 +491,8 @@ static void display_thread(void *a, void *b, void *c)
 		}
 		g_latest = f;
 
-		/* TODO(F4): desenhar as barras do espectro. Por ora, tela de status
-		 * (texto) a ~5 Hz - prova a cadeia ate o OLED. */
-		if (!have_disp || now - last_draw < 200) {
+		/* desenha a ~20 fps (I2C fast a 400 kHz aguenta ~30 fps) */
+		if (!have_disp || now - last_draw < 50) {
 			continue;
 		}
 		last_draw = now;
@@ -447,13 +521,52 @@ static void display_thread(void *a, void *b, void *c)
 				cfb_print(disp, "---", 0, 16);
 				cfb_print(disp, "toque uma nota", 0, 32);
 			}
+		} else if (m == MODE_SPECTRUM) {
+			/* 32 barras de 4 px usando a altura toda (0..63) */
+			for (int b = 0; b < N_BARS; b++) {
+				int h = f.bars[b];
+
+				if (h > 0) {
+					cfb_invert_area(disp, b * 4, 63 - h, 3, h);
+				}
+			}
+		} else if (m == MODE_WAVE) {
+			/* mini-osciloscopio: 16 ms de sinal (256 amostras, 2 por
+			 * coluna), gatilho por cruzamento de zero (estabiliza a
+			 * onda) e ganho vertical automatico pelo pico recente */
+			uint32_t base = (tuner_pos - 256 - 128) & (TUNER_WIN - 1);
+			uint32_t trig = 0;
+
+			for (uint32_t i = 0; i < 128; i++) {
+				float a = tuner_ring[(base + i) & (TUNER_WIN - 1)];
+				float b = tuner_ring[(base + i + 1) &
+						     (TUNER_WIN - 1)];
+
+				if (a < 0.0f && b >= 0.0f) {
+					trig = i + 1;
+					break;
+				}
+			}
+
+			float pk = MAX((float)rt.level, 20000.0f);
+			float scale = 30.0f / pk;
+
+			for (int c = 0; c < 128; c++) {
+				float v = tuner_ring[(base + trig + c * 2) &
+						     (TUNER_WIN - 1)];
+				int y = 32 - (int)(v * scale);
+
+				y = CLAMP(y, 0, 62);
+				cfb_invert_area(disp, c, y, 1, 2);
+			}
 		} else {
 			cfb_print(disp, "Analisador RT", 0, 0);
 			snprintf(line, sizeof(line), "nivel: %u", rt.level);
 			cfb_print(disp, line, 0, 16);
-			snprintf(line, sizeof(line), "modo: %s", mode_name[m]);
+			snprintf(line, sizeof(line), "fps: %u  ov: %u",
+				 rt.display_fps, rt.overruns);
 			cfb_print(disp, line, 0, 32);
-			snprintf(line, sizeof(line), "fps: %u", rt.display_fps);
+			snprintf(line, sizeof(line), "proc: %u us", rt.fft_us_last);
 			cfb_print(disp, line, 0, 48);
 		}
 		cfb_framebuffer_finalize(disp);
@@ -526,8 +639,8 @@ static int cmd_rt_watch(const struct shell *sh, size_t argc, char **argv)
 			break;
 		}
 		case MODE_WAVE:
-			shell_print(sh, "[wave] frame %u (forma de onda - TODO F4)",
-				    f.seq);
+			shell_print(sh, "[wave] frame %u nivel=%u (onda no OLED)",
+				    f.seq, rt.level);
 			break;
 		default:
 			shell_print(sh, "[stats] fps=%u fft=%u us max=%u us overruns=%u",
