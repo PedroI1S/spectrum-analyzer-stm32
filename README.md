@@ -28,6 +28,8 @@ completo está em [`plano_projeto_analisador_espectro_zephyr.md`](plano_projeto_
 - ✅ **F3 (afinador) concluído** — detector de nota por autocorrelação (Fs calibrada 16039,3 Hz,
   interpolação parabólica): modo `tuner` no OLED (nota + Hz + cents + barra de afinação) e comando
   `rt tune [s]`. Validado com instrumento — estável, 0 overruns, dentro do deadline hard-RT.
+  Faixa validada: **E2 a D7 (82–2349 Hz)**; precisão de cents plena na faixa de instrumento
+  (80–1000 Hz), degradando nos agudos. Sensibilidade em 3 níveis: `rt sens <alta|media|baixa>`.
 - ✅ **F4 (espectro/onda) concluído** — FFT 512 (CMSIS-DSP, janela de Hann) → 32 barras log/dB
   em tela cheia a ~20 fps; modo `wave` = mini-osciloscópio (16 ms, gatilho por cruzamento de zero,
   ganho automático). Botão azul cicla: tuner → spectrum → wave → stats. Bug clássico documentado:

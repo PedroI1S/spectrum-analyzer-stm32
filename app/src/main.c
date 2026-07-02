@@ -69,10 +69,25 @@ LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
 #define TUNER_WIN        1024     /* 64 ms de sinal (>5 periodos do E2 = 82 Hz);
 				   * janela maior (2048) estourava o deadline do
 				   * bloco: ACF media ~43 ms > 32 ms */
-#define TUNER_LAG_MIN    12       /* ~1337 Hz */
-#define TUNER_LAG_MAX    400      /* ~40 Hz */
-#define TUNER_LEVEL_GATE 150000   /* pico 24-bit minimo p/ tentar detectar */
-#define TUNER_ACF_MIN_Q  0.30f    /* qualidade minima (acf_pico/energia) */
+#define TUNER_LAG_MIN    6        /* teto ~2670 Hz; com 12 o teto era 1337 Hz e
+				   * notas na borda (ex.: E6=1318 Hz) caiam uma
+				   * oitava: o pico real ficava fora da busca e
+				   * o detector pegava o de 2x o periodo */
+#define TUNER_LAG_MAX    400      /* piso ~40 Hz */
+
+/* sensibilidade do afinador (rt sens <alta|media|baixa>):
+ * gate  = pico 24-bit minimo p/ tentar detectar (menor = pega som mais fraco)
+ * min_q = qualidade minima da ACF (acf_pico/energia; maior = mais rigoroso) */
+static const struct {
+	const char *name;
+	int32_t gate;
+	float min_q;
+} sens_tbl[] = {
+	{ "alta",  15000,  0.25f },
+	{ "media", 50000,  0.30f },
+	{ "baixa", 150000, 0.35f },
+};
+static atomic_t sens_idx = ATOMIC_INIT(1);   /* padrao: media */
 
 static const char *const note_names[12] = {
 	"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
@@ -218,7 +233,7 @@ static float tuner_detect(void)
 			rmax = acc;
 		}
 	}
-	if (rmax < TUNER_ACF_MIN_Q * r0) {
+	if (rmax < sens_tbl[atomic_get(&sens_idx)].min_q * r0) {
 		return 0.0f;    /* sem periodicidade clara (ruido/silencio) */
 	}
 
@@ -424,7 +439,8 @@ static void acq_fft_thread(void *a, void *b, void *c)
 		}
 
 		/* afinador: so tenta detectar com janela cheia e nivel suficiente */
-		if (tuner_fill >= TUNER_WIN && pk_l >= TUNER_LEVEL_GATE) {
+		if (tuner_fill >= TUNER_WIN &&
+		    pk_l >= sens_tbl[atomic_get(&sens_idx)].gate) {
 			float f0 = tuner_detect();
 
 			if (f0 > 0.0f) {
@@ -592,6 +608,7 @@ static int cmd_rt_status(const struct shell *sh, size_t argc, char **argv)
 	} else {
 		shell_print(sh, "nota=--- (sem sinal periodico acima do limiar)");
 	}
+	shell_print(sh, "sensibilidade=%s", sens_tbl[atomic_get(&sens_idx)].name);
 	shell_print(sh, "modo=%s", mode_name[atomic_get(&disp_mode)]);
 	if (rt.i2s_ok) {
 		shell_print(sh, "I2S=ok  Fs real=%d.%d Hz", (int)FS_ACTUAL_HZ,
@@ -654,6 +671,29 @@ static int cmd_rt_watch(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_rt_sens(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc < 2) {
+		int i = atomic_get(&sens_idx);
+
+		shell_print(sh, "sensibilidade atual: %s (gate=%d, q=%d%%)",
+			    sens_tbl[i].name, sens_tbl[i].gate,
+			    (int)(sens_tbl[i].min_q * 100));
+		shell_print(sh, "uso: rt sens <alta|media|baixa>");
+		return 0;
+	}
+	for (int i = 0; i < (int)ARRAY_SIZE(sens_tbl); i++) {
+		if (strcmp(argv[1], sens_tbl[i].name) == 0) {
+			atomic_set(&sens_idx, i);
+			shell_print(sh, "sensibilidade -> %s (gate=%d)",
+				    sens_tbl[i].name, sens_tbl[i].gate);
+			return 0;
+		}
+	}
+	shell_error(sh, "sensibilidade invalida: use alta | media | baixa");
+	return -EINVAL;
+}
+
 static int cmd_rt_tune(const struct shell *sh, size_t argc, char **argv)
 {
 	int secs = (argc > 1) ? atoi(argv[1]) : 10;
@@ -698,6 +738,7 @@ static int cmd_rt_help(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "Analisador de espectro - comandos:");
 	shell_print(sh, "  rt status      metricas RT: Fs, N, tempo de processamento, fps, overruns");
 	shell_print(sh, "  rt tune [s]    afinador ao vivo por [s] segundos (nota + Hz + cents)");
+	shell_print(sh, "  rt sens <n>    sensibilidade do afinador: alta | media | baixa");
 	shell_print(sh, "  rt watch [s]   espectro ao vivo por [s] segundos (padrao 5, termina sozinho)");
 	shell_print(sh, "  rt dump        amostras cruas do I2S (diagnostico)");
 	shell_print(sh, "  rt mode <m>    modo do display: tuner | spectrum | wave | stats");
@@ -715,6 +756,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(rt_sub,
 	SHELL_CMD(help, NULL, "Lista os comandos do analisador e o que fazem", cmd_rt_help),
 	SHELL_CMD(status, NULL, "Metricas de tempo real", cmd_rt_status),
 	SHELL_CMD_ARG(tune, NULL, "Afinador ao vivo: rt tune [s]", cmd_rt_tune, 1, 1),
+	SHELL_CMD_ARG(sens, NULL, "Sensibilidade: rt sens <alta|media|baixa>",
+		      cmd_rt_sens, 1, 1),
 	SHELL_CMD(dump, NULL, "Amostras cruas do I2S (diagnostico)", cmd_rt_dump),
 	SHELL_CMD_ARG(watch, NULL, "Espectro ao vivo por N segundos: rt watch [s]",
 		      cmd_rt_watch, 1, 1),
