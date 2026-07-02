@@ -135,7 +135,24 @@ static struct {
 	uint32_t level;      /* nivel de audio (pico do bloco) */
 	bool     i2s_ok;     /* aquisicao I2S ativa */
 	int      i2s_err;    /* codigo de erro se a init do I2S falhar */
+	/* jitter da aquisicao: periodo entre chegadas de bloco (us).
+	 * nominal = FFT_SIZE / Fs_real = 512 / 16039,3 Hz = 31922 us */
+	uint32_t per_us_last;
+	uint32_t per_us_min;
+	uint32_t per_us_max;
+	uint64_t per_us_sum;
+	uint32_t per_n;
 } rt;
+
+#define BLOCK_PERIOD_NOM_US 31922U
+
+static void jitter_reset(void)
+{
+	rt.per_us_min = UINT32_MAX;
+	rt.per_us_max = 0;
+	rt.per_us_sum = 0;
+	rt.per_n = 0;
+}
 
 /* ultimo frame "desenhado" pelo display; exibido sob demanda por 'rt watch' */
 static struct spectrum_frame g_latest;
@@ -352,10 +369,13 @@ static void acq_fft_thread(void *a, void *b, void *c)
 		.timeout = I2S_TIMEOUT_MS,
 	};
 	uint32_t seq = 0;
+	uint32_t prev_cyc = 0;
+	bool have_prev = false;
 
 	int rc;
 
 	spectrum_init();
+	jitter_reset();
 
 	if (!device_is_ready(i2s_dev)) {
 		rt.i2s_err = -ENODEV;
@@ -384,9 +404,26 @@ static void acq_fft_thread(void *a, void *b, void *c)
 
 		if (ret != 0) {
 			rt.overruns++;
+			have_prev = false;   /* nao medir periodo sobre um buraco */
 			LOG_WRN("i2s_read: %d", ret);
 			continue;
 		}
+
+		/* jitter: periodo entre chegadas de bloco, visto pela aplicacao
+		 * (inclui latencia de escalonamento - e o que importa p/ o deadline) */
+		uint32_t now_cyc = k_cycle_get_32();
+
+		if (have_prev) {
+			uint32_t per = k_cyc_to_us_floor32(now_cyc - prev_cyc);
+
+			rt.per_us_last = per;
+			rt.per_us_min = MIN(rt.per_us_min, per);
+			rt.per_us_max = MAX(rt.per_us_max, per);
+			rt.per_us_sum += per;
+			rt.per_n++;
+		}
+		prev_cyc = now_cyc;
+		have_prev = true;
 
 		uint32_t t0 = k_cycle_get_32();
 		const uint32_t *s = block;
@@ -576,13 +613,15 @@ static void display_thread(void *a, void *b, void *c)
 				cfb_invert_area(disp, c, y, 1, 2);
 			}
 		} else {
-			cfb_print(disp, "Analisador RT", 0, 0);
-			snprintf(line, sizeof(line), "nivel: %u", rt.level);
-			cfb_print(disp, line, 0, 16);
-			snprintf(line, sizeof(line), "fps: %u  ov: %u",
+			snprintf(line, sizeof(line), "fps:%u  ov:%u",
 				 rt.display_fps, rt.overruns);
-			cfb_print(disp, line, 0, 32);
+			cfb_print(disp, line, 0, 0);
 			snprintf(line, sizeof(line), "proc: %u us", rt.fft_us_last);
+			cfb_print(disp, line, 0, 16);
+			snprintf(line, sizeof(line), "per: %u us", rt.per_us_last);
+			cfb_print(disp, line, 0, 32);
+			snprintf(line, sizeof(line), "jit: %u us",
+				 rt.per_n ? rt.per_us_max - rt.per_us_min : 0);
 			cfb_print(disp, line, 0, 48);
 		}
 		cfb_framebuffer_finalize(disp);
@@ -599,6 +638,11 @@ static int cmd_rt_status(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "fft: ultimo=%u us  max=%u us", rt.fft_us_last,
 		    rt.fft_us_max);
 	shell_print(sh, "overruns=%u", rt.overruns);
+	if (rt.per_n > 0) {
+		shell_print(sh, "periodo=%u us (nominal %u)  jitter pp=%u us",
+			    rt.per_us_last, BLOCK_PERIOD_NOM_US,
+			    rt.per_us_max - rt.per_us_min);
+	}
 	shell_print(sh, "nivel(pico)=%u", rt.level);
 	if (g_latest.note_valid) {
 		shell_print(sh, "nota=%s%d  f0=%u.%u Hz  desvio=%+d cents",
@@ -671,6 +715,35 @@ static int cmd_rt_watch(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_rt_jitter(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc > 1 && strcmp(argv[1], "reset") == 0) {
+		jitter_reset();
+		shell_print(sh, "estatisticas de jitter zeradas");
+		return 0;
+	}
+	if (rt.per_n == 0) {
+		shell_print(sh, "sem medidas ainda (aquisicao parada?)");
+		return 0;
+	}
+
+	uint32_t avg = (uint32_t)(rt.per_us_sum / rt.per_n);
+
+	shell_print(sh, "periodo do bloco (n=%u, nominal=%u us):", rt.per_n,
+		    BLOCK_PERIOD_NOM_US);
+	shell_print(sh, "  ultimo=%u  min=%u  medio=%u  max=%u us",
+		    rt.per_us_last, rt.per_us_min, avg, rt.per_us_max);
+	shell_print(sh, "  jitter pico-a-pico=%u us (%u%% do periodo)",
+		    rt.per_us_max - rt.per_us_min,
+		    (rt.per_us_max - rt.per_us_min) * 100 / BLOCK_PERIOD_NOM_US);
+	shell_print(sh, "  deadline: proc max=%u us < %u us %s  overruns=%u",
+		    rt.fft_us_max, BLOCK_PERIOD_NOM_US,
+		    rt.fft_us_max < BLOCK_PERIOD_NOM_US ? "OK" : "ESTOURADO",
+		    rt.overruns);
+	shell_print(sh, "uso: rt jitter [reset]");
+	return 0;
+}
+
 static int cmd_rt_sens(const struct shell *sh, size_t argc, char **argv)
 {
 	if (argc < 2) {
@@ -739,6 +812,7 @@ static int cmd_rt_help(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "  rt status      metricas RT: Fs, N, tempo de processamento, fps, overruns");
 	shell_print(sh, "  rt tune [s]    afinador ao vivo por [s] segundos (nota + Hz + cents)");
 	shell_print(sh, "  rt sens <n>    sensibilidade do afinador: alta | media | baixa");
+	shell_print(sh, "  rt jitter      estatisticas do periodo de bloco (jitter, deadline); [reset] zera");
 	shell_print(sh, "  rt watch [s]   espectro ao vivo por [s] segundos (padrao 5, termina sozinho)");
 	shell_print(sh, "  rt dump        amostras cruas do I2S (diagnostico)");
 	shell_print(sh, "  rt mode <m>    modo do display: tuner | spectrum | wave | stats");
@@ -758,6 +832,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(rt_sub,
 	SHELL_CMD_ARG(tune, NULL, "Afinador ao vivo: rt tune [s]", cmd_rt_tune, 1, 1),
 	SHELL_CMD_ARG(sens, NULL, "Sensibilidade: rt sens <alta|media|baixa>",
 		      cmd_rt_sens, 1, 1),
+	SHELL_CMD_ARG(jitter, NULL, "Jitter do periodo de bloco: rt jitter [reset]",
+		      cmd_rt_jitter, 1, 1),
 	SHELL_CMD(dump, NULL, "Amostras cruas do I2S (diagnostico)", cmd_rt_dump),
 	SHELL_CMD_ARG(watch, NULL, "Espectro ao vivo por N segundos: rt watch [s]",
 		      cmd_rt_watch, 1, 1),

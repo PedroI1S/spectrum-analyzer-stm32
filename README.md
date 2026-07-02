@@ -34,7 +34,11 @@ completo está em [`plano_projeto_analisador_espectro_zephyr.md`](plano_projeto_
   em tela cheia a ~20 fps; modo `wave` = mini-osciloscópio (16 ms, gatilho por cruzamento de zero,
   ganho automático). Botão azul cicla: tuner → spectrum → wave → stats. Bug clássico documentado:
   float em duas threads exige `CONFIG_FPU_SHARING=y` (sem isso a placa trava).
-- ⏳ Próximo (F6): métricas de jitter, documentação final e vídeo de demo. Ver §11 e §15 do plano.
+- ✅ **F6 (robustez/métricas) concluído** — jitter da aquisição medido na placa via `rt jitter`:
+  **4 µs pico-a-pico em 1100 blocos** (0,01% do período de 31,92 ms), 0 overruns, deadline com 42%
+  de folga. Taxa de amostragem gerada por hardware (I2S/PLLI2S) + DMA → jitter de amostragem nulo.
+- **Projeto funcionalmente completo** (F0–F6). Checklist do enunciado: ☑ em todos os itens (§13 do plano).
+  Resta apenas o vídeo de demonstração.
 
 ## Como construir, gravar e ver o console
 

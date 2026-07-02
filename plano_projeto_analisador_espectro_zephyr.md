@@ -259,7 +259,7 @@ Ajustar as semanas ao prazo real da disciplina.
 | F3 — DSP | FFT + magnitudes + janela | **✅ concluído (pitch/afinador):** detecção da fundamental por autocorrelação (janela 1024, interpolação parabólica, Fs calibrada 16039,3 Hz) → nota + cents no OLED e `rt tune`; estável, sem overruns, dentro do deadline. FFT em barras p/ o espectro fica na F4 |
 | F4 — Integração | Espectro ao vivo no OLED; tarefas hard/soft separadas | **✅ concluído:** FFT 512 (CMSIS-DSP) → 32 barras log/dB em tela cheia a ~20 fps; modo wave = mini-osciloscópio (16 ms, gatilho de cruzamento de zero, ganho automático). FFT ~0,5 ms; ACF+FFT dentro do deadline; 0 overruns |
 | F5 — Interação | Botão troca telas; LED como referência; comandos `rt …` | Três telas funcionam; shell mostra métricas RT |
-| F6 — Robustez & doc | Medição de jitter/overruns; README; vídeo de demo | Sem overruns em operação normal; documentação pronta |
+| F6 — Robustez & doc | Medição de jitter/overruns; README; vídeo de demo | **✅ concluído (métricas + doc):** jitter medido na placa = **4 µs pico-a-pico** em 1100 blocos (0,01% do período de 31,92 ms), 0 overruns, deadline com 42% de folga (`rt jitter`). Vídeo de demo fica a cargo do grupo |
 
 ---
 
@@ -277,14 +277,14 @@ Pares revisam o código um do outro; integração contínua a partir da F4.
 
 | Requisito | Entrega no projeto | ✔ |
 |---|---|---|
-| ≥ 1 tarefa hard real-time | `acq_fft` (aquisição + FFT) | ☐ |
-| ≥ 1 tarefa soft real-time | `display` (atualização do OLED) | ☐ |
-| Tarefa de console/shell com info do sistema | Shell + `kernel threads/stacks` + `rt status` | ☐ |
-| Comando para info das tarefas de tempo real | `rt status` (Fs, tempo FFT, overruns, fps) | ☐ |
-| Impressão no console **não intrusiva** | Thread do shell + leitura de variáveis | ☐ |
-| Tarefa para piscar LED | `blink` com `k_timer` | ☐ |
-| Tarefa acionada pelo botão da placa | IRQ GPIO → work queue → troca de tela | ☐ |
-| Sem polling no código de aplicação | Semáforos, msgq, work queue, timers | ☐ |
+| ≥ 1 tarefa hard real-time | `acq_fft` (aquisição + FFT) | ☑ |
+| ≥ 1 tarefa soft real-time | `display` (atualização do OLED) | ☑ |
+| Tarefa de console/shell com info do sistema | Shell + `kernel threads/stacks` + `rt status` | ☑ |
+| Comando para info das tarefas de tempo real | `rt status` (Fs, tempo FFT, overruns, fps) | ☑ |
+| Impressão no console **não intrusiva** | Thread do shell + leitura de variáveis | ☑ |
+| Tarefa para piscar LED | `blink` com `k_timer` | ☑ |
+| Tarefa acionada pelo botão da placa | IRQ GPIO → work queue → troca de tela | ☑ |
+| Sem polling no código de aplicação | Semáforos, msgq, work queue, timers | ☑ |
 | RTOS diferente do visto em aula (não FreeRTOS) | Zephyr | ☑ |
 
 ---
@@ -348,7 +348,7 @@ west flash -d build --runner openocd # runner padrao tenta STM32CubeProgrammer; 
   - **Sensibilidade configurável** (`rt sens <alta|media|baixa>`): gate de nível 15k/50k/150k (pico 24-bit) + rigor da ACF 25/30/35%. Padrão `media`; volta ao padrão no reset (persistência em flash fica como melhoria futura).
 - ✅ **F4 (espectro/onda) concluída** — módulo `cmsis-dsp` adicionado à allowlist do `west.yml` (com allowlist, o `project-filter` sugerido na §7.1 não se aplica). FFT real de 512 pontos com janela de Hann (`arm_rfft_fast_f32` + `arm_cmplx_mag_f32`, ~0,5 ms), 32 bandas em progressão geométrica, magnitude em dB (piso 80 / topo 175 dB) → barras em tela cheia a ~20 fps. Modo `wave` = mini-osciloscópio: 16 ms de sinal, gatilho por cruzamento de zero e ganho vertical automático. Freq. dominante = f0 do afinador quando há nota (mais precisa), senão o bin dominante da FFT.
 - **Bug clássico de RTOS encontrado:** ao usar float na thread `display` (que antes só fazia inteiros), a placa travava — com `CONFIG_FPU=y` sem `CONFIG_FPU_SHARING=y`, os registradores do FPU não são salvos no context switch e duas threads com float corrompem o estado. Correção: `CONFIG_FPU_SHARING=y`. Lição: FPU + multithreading exigem FPU sharing.
-- **F6 — Robustez/doc:** métricas de jitter, README final, vídeo de demo.
+- ✅ **F6 (robustez/métricas) concluída** — instrumentação de jitter na `acq_fft`: período entre chegadas de bloco medido com `k_cycle_get_32()` (inclui a latência de escalonamento — é o que a aplicação vê). Comando **`rt jitter [reset]`** (min/médio/máx/pico-a-pico + veredito do deadline) e tela `stats` no OLED (fps, overruns, proc, per, jit). **Medido na placa (30 s / 1100 blocos): jitter pico-a-pico = 4 µs** (0,01% do período nominal de 31.922 µs), proc máx = 18,4 ms < 31,9 ms (deadline com 42% de folga), **0 overruns** — a taxa de amostragem é gerada por hardware (I2S/PLLI2S) e o DMA move os dados sem CPU, então o jitter de amostragem é nulo e o de entrega, desprezível. Falta apenas o vídeo de demo (a cargo do grupo).
 
 ### 15.5 Bugs encontrados na F2 (registro técnico)
 
