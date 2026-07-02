@@ -256,7 +256,7 @@ Ajustar as semanas ao prazo real da disciplina.
 | F0 — Bring-up | Projeto Zephyr compila e `blinky` roda; shell responde | **✅ concluído:** compila/grava, LED pisca (`k_timer`), botão troca modo (IRQ→work), shell por RTT responde (`kernel thread list`, `kernel stacks`, `rt status`, `rt mode`). Esqueleto RT do §4 implementado e validado. Ver §15 |
 | F1 — Display | OLED desenha texto/figuras de teste | **✅ concluído:** SSD1306 (I2C1 @ 0x3c) desenhando via CFB — mostra f0/modo/fps. Barras graficas ficam para a F4 |
 | F2 — Aquisição I2S | INMP441 lê amostras via DMA | **✅ concluído (aquisição):** I2S2+DMA capturando a 16 kHz, amostras 24-bit coerentes (silêncio = ruído baixo; R=0 com L/R=GND); fps=31, 0 overruns. Ver §15.5 para os 2 bugs achados |
-| F3 — DSP | FFT + magnitudes + janela | Tom de 1 kHz → pico no bin correto; frequência dominante correta |
+| F3 — DSP | FFT + magnitudes + janela | **✅ concluído (pitch/afinador):** detecção da fundamental por autocorrelação (janela 1024, interpolação parabólica, Fs calibrada 16039,3 Hz) → nota + cents no OLED e `rt tune`; estável, sem overruns, dentro do deadline. FFT em barras p/ o espectro fica na F4 |
 | F4 — Integração | Espectro ao vivo no OLED; tarefas hard/soft separadas | Espectro responde ao som em tempo real |
 | F5 — Interação | Botão troca telas; LED como referência; comandos `rt …` | Três telas funcionam; shell mostra métricas RT |
 | F6 — Robustez & doc | Medição de jitter/overruns; README; vídeo de demo | Sem overruns em operação normal; documentação pronta |
@@ -343,7 +343,8 @@ west flash -d build --runner openocd # runner padrao tenta STM32CubeProgrammer; 
 - ✅ **F1 concluído** — SSD1306 no I2C1 (SCL=PB6, SDA=PB9, 0x3c) via CFB, mostrando f0/modo/fps. Overlay + `CONFIG_DISPLAY/SSD1306/I2C/CHARACTER_FRAMEBUFFER`.
 - **Pinout confirmado (contra o board dts):** mic INMP441 no **I2S2** (CK=PB13, WS=PB12, SD=PB15, L/R=GND); OLED no **I2C1** (PB6/PB9). Obs: PB13 é do CAN2 no board → `&can2` desabilitado no overlay.
 - ✅ **F2 (aquisição) concluída** — I2S2 + DMA capturando o INMP441 a 16 kHz, 24 bits corretos, 0 overruns. Ver §15.5.
-- **F3 — DSP/afinador:** detector de nota por **autocorrelação** (afinador: nota + cents) e depois FFT (CMSIS-DSP: `west config manifest.project-filter -- +cmsis-dsp`).
+- ✅ **F3 (pitch/afinador) concluída** — detector de nota por **autocorrelação** na thread hard-RT: janela deslizante de 1024 amostras (64 ms), primeiro pico ≥85% do máximo (robusto a harmônicos), interpolação parabólica (precisão sub-amostra), gate de nível + gate de qualidade. **Fs calibrada = 16039,3 Hz** (o prescaler do I2S arredonda: PLLI2S 135,5 MHz/132/64 — usar 16000 nominal daria ~4 cents de erro sistemático). Modo `tuner` no display (nota, Hz, cents e barra de afinação) + comando `rt tune [s]`. Lição de RT: janela de 2048 estourava o deadline (ACF ~43 ms > bloco de 32 ms) → reduzida para 1024. Validado com instrumento: estável, 0 overruns.
+- **F4 — Espectro:** FFT em barras para o display (CMSIS-DSP: `west config manifest.project-filter -- +cmsis-dsp`), modos wave/spectrum reais.
 
 ### 15.5 Bugs encontrados na F2 (registro técnico)
 

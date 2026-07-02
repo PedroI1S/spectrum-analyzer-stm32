@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
 
@@ -58,16 +59,41 @@ LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
 #define I2S_BLOCK_COUNT      3
 #define I2S_TIMEOUT_MS       2000
 
-/* ===== Modos de exibicao (plano, secao 8) ===== */
-enum disp_mode { MODE_SPECTRUM = 0, MODE_WAVE, MODE_STATS, MODE_COUNT };
-static const char *const mode_name[MODE_COUNT] = { "spectrum", "wave", "stats" };
-static atomic_t disp_mode = ATOMIC_INIT(MODE_SPECTRUM);
+/* ===== Afinador (deteccao de pitch por autocorrelacao) =====
+ * Fs REAL: PLLI2S = HSE 8M /8 *271 /2 = 135,5 MHz; o driver arredonda o
+ * prescaler p/ 132 -> bit clock 1,02652 MHz -> Fs = /64 = 16039,3 Hz.
+ * Usar a Fs nominal (16000) daria um erro sistematico de ~4 cents.
+ */
+#define FS_ACTUAL_HZ     16039.3f
+#define TUNER_WIN        1024     /* 64 ms de sinal (>5 periodos do E2 = 82 Hz);
+				   * janela maior (2048) estourava o deadline do
+				   * bloco: ACF media ~43 ms > 32 ms */
+#define TUNER_LAG_MIN    12       /* ~1337 Hz */
+#define TUNER_LAG_MAX    400      /* ~40 Hz */
+#define TUNER_LEVEL_GATE 150000   /* pico 24-bit minimo p/ tentar detectar */
+#define TUNER_ACF_MIN_Q  0.30f    /* qualidade minima (acf_pico/energia) */
 
-/* ===== Frame de espectro publicado pela acq_fft para o display ===== */
+static const char *const note_names[12] = {
+	"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+};
+
+/* ===== Modos de exibicao (plano, secao 8 + modo afinador) ===== */
+enum disp_mode { MODE_TUNER = 0, MODE_SPECTRUM, MODE_WAVE, MODE_STATS, MODE_COUNT };
+static const char *const mode_name[MODE_COUNT] = {
+	"tuner", "spectrum", "wave", "stats"
+};
+static atomic_t disp_mode = ATOMIC_INIT(MODE_TUNER);
+
+/* ===== Frame publicado pela acq_fft para o display ===== */
 struct spectrum_frame {
 	uint8_t  bars[N_BARS];   /* magnitude por barra, 0..63 (altura no OLED) */
 	uint16_t dominant_hz;    /* frequencia dominante do bloco */
 	uint32_t seq;            /* numero do frame */
+	/* afinador */
+	uint16_t f0_dhz;         /* fundamental em deci-Hz (824 = 82,4 Hz) */
+	int16_t  cents;          /* desvio da nota mais proxima, em cents */
+	uint8_t  midi;           /* numero MIDI da nota mais proxima */
+	uint8_t  note_valid;     /* 1 = ha nota detectada */
 };
 
 /* ===== Sincronizacao - nada de polling ===== */
@@ -129,6 +155,101 @@ static void button_isr(const struct device *port, struct gpio_callback *cb,
 	k_work_submit(&mode_work);
 }
 
+/* ===== Deteccao de pitch por autocorrelacao (janela deslizante) =====
+ * Autocorrelacao e o metodo classico de afinador: robusta aos harmonicos
+ * fortes de uma corda (o maior pico da FFT costuma ser um harmonico, nao a
+ * fundamental) e com precisao sub-amostra via interpolacao parabolica.
+ */
+static float tuner_ring[TUNER_WIN];    /* ultimas TUNER_WIN amostras (canal L) */
+static uint32_t tuner_pos, tuner_fill;
+
+/* retorna f0 em Hz (ou 0 se nao ha nota confiavel) */
+static float tuner_detect(void)
+{
+	static float x[TUNER_WIN];
+	static float acf[TUNER_LAG_MAX + 2];
+
+	/* lineariza o anel em ordem temporal */
+	uint32_t p = tuner_pos;
+
+	memcpy(x, &tuner_ring[p], (TUNER_WIN - p) * sizeof(float));
+	memcpy(&x[TUNER_WIN - p], tuner_ring, p * sizeof(float));
+
+	/* remove DC */
+	float mean = 0.0f;
+
+	for (int i = 0; i < TUNER_WIN; i++) {
+		mean += x[i];
+	}
+	mean /= TUNER_WIN;
+	for (int i = 0; i < TUNER_WIN; i++) {
+		x[i] -= mean;
+	}
+
+	/* energia (lag 0) */
+	float r0 = 0.0f;
+
+	for (int i = 0; i < TUNER_WIN; i++) {
+		r0 += x[i] * x[i];
+	}
+	if (r0 < 1.0f) {
+		return 0.0f;
+	}
+
+	/* autocorrelacao nos lags de interesse */
+	float rmax = 0.0f;
+
+	for (int lag = TUNER_LAG_MIN; lag <= TUNER_LAG_MAX; lag++) {
+		float acc = 0.0f;
+
+		for (int i = 0; i < TUNER_WIN - lag; i++) {
+			acc += x[i] * x[i + lag];
+		}
+		acf[lag] = acc;
+		if (acc > rmax) {
+			rmax = acc;
+		}
+	}
+	if (rmax < TUNER_ACF_MIN_Q * r0) {
+		return 0.0f;    /* sem periodicidade clara (ruido/silencio) */
+	}
+
+	/* fundamental = PRIMEIRO pico local >= 85% do maximo (evita cair no
+	 * multiplo do periodo e no harmonico) */
+	int l = 0;
+	float thr = 0.85f * rmax;
+
+	for (int lag = TUNER_LAG_MIN + 1; lag < TUNER_LAG_MAX; lag++) {
+		if (acf[lag] >= thr && acf[lag] >= acf[lag - 1] &&
+		    acf[lag] >= acf[lag + 1]) {
+			l = lag;
+			break;
+		}
+	}
+	if (l == 0) {
+		return 0.0f;
+	}
+
+	/* interpolacao parabolica p/ lag fracionario (precisao sub-amostra) */
+	float den = acf[l - 1] - 2.0f * acf[l] + acf[l + 1];
+	float delta = (den != 0.0f) ? 0.5f * (acf[l - 1] - acf[l + 1]) / den : 0.0f;
+
+	if (delta < -0.5f || delta > 0.5f) {
+		delta = 0.0f;
+	}
+	return FS_ACTUAL_HZ / ((float)l + delta);
+}
+
+/* converte f0 -> nota MIDI mais proxima + desvio em cents (A4 = 440 Hz) */
+static void tuner_note(float f0, uint8_t *midi, int16_t *cents)
+{
+	float c_a4 = 1200.0f * log2f(f0 / 440.0f);   /* cents relativos ao A4 */
+	int n = (int)lroundf(c_a4 / 100.0f);         /* semitons ate a nota */
+
+	*midi = (uint8_t)(69 + n);
+	*cents = (int16_t)lroundf(c_a4 - 100.0f * (float)n);
+}
+
 /* ===== acq_fft (hard RT) - le o I2S via DMA, processa e publica =====
  * O i2s_read bloqueia ate o DMA entregar um bloco: e o proprio relogio
  * hard RT da aquisicao (sem polling). */
@@ -184,8 +305,7 @@ static void acq_fft_thread(void *a, void *b, void *c)
 		uint32_t frames = nbytes / (I2S_WORDS_PER_FRAME * 4);
 		int32_t pk_l = 0, pk_r = 0;
 
-		/* TODO(F3): janela + FFT/autocorrelacao (CMSIS-DSP). Por ora mede o
-		 * pico dos dois canais e guarda amostras cruas p/ diagnostico ('rt dump'). */
+		/* pico dos dois canais + janela deslizante do afinador */
 		for (uint32_t i = 0; i < frames; i++) {
 			const uint32_t *fr = &s[i * I2S_WORDS_PER_FRAME];
 			/* recombina as metades 16-bit e extrai 24 bits com sinal */
@@ -200,6 +320,12 @@ static void acq_fft_thread(void *a, void *b, void *c)
 			if (ar > pk_r) {
 				pk_r = ar;
 			}
+
+			tuner_ring[tuner_pos] = (float)l;
+			tuner_pos = (tuner_pos + 1) & (TUNER_WIN - 1);
+		}
+		if (tuner_fill < TUNER_WIN) {
+			tuner_fill += frames;
 		}
 		for (int j = 0; j < 4; j++) {
 			const uint32_t *fr = &s[j * I2S_WORDS_PER_FRAME];
@@ -215,7 +341,7 @@ static void acq_fft_thread(void *a, void *b, void *c)
 
 		rt.level = (uint32_t)peak;
 
-		struct spectrum_frame f = { .seq = seq, .dominant_hz = 0 };
+		struct spectrum_frame f = { .seq = seq };
 		uint8_t h = peak >> 17;            /* escala grosseira p/ VU 0..63 */
 
 		if (h > 63) {
@@ -224,6 +350,19 @@ static void acq_fft_thread(void *a, void *b, void *c)
 		for (int i = 0; i < N_BARS; i++) {
 			f.bars[i] = h;
 		}
+
+		/* afinador: so tenta detectar com janela cheia e nivel suficiente */
+		if (tuner_fill >= TUNER_WIN && pk_l >= TUNER_LEVEL_GATE) {
+			float f0 = tuner_detect();
+
+			if (f0 > 0.0f) {
+				tuner_note(f0, &f.midi, &f.cents);
+				f.f0_dhz = (uint16_t)lroundf(f0 * 10.0f);
+				f.dominant_hz = (uint16_t)lroundf(f0);
+				f.note_valid = 1;
+			}
+		}
+		rt.dominant_hz = f.dominant_hz;
 
 		rt.fft_us_last = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
 		rt.fft_us_max = MAX(rt.fft_us_max, rt.fft_us_last);
@@ -284,17 +423,39 @@ static void display_thread(void *a, void *b, void *c)
 		}
 		last_draw = now;
 
-		char line[24];
+		char line[32];
+		enum disp_mode m = atomic_get(&disp_mode);
 
 		cfb_framebuffer_clear(disp, false);
-		cfb_print(disp, "Analisador RT", 0, 0);
-		snprintf(line, sizeof(line), "nivel: %u", rt.level);
-		cfb_print(disp, line, 0, 16);
-		snprintf(line, sizeof(line), "modo: %s",
-			 mode_name[atomic_get(&disp_mode)]);
-		cfb_print(disp, line, 0, 32);
-		snprintf(line, sizeof(line), "fps: %u", rt.display_fps);
-		cfb_print(disp, line, 0, 48);
+		if (m == MODE_TUNER) {
+			cfb_print(disp, "Afinador", 0, 0);
+			if (f.note_valid) {
+				snprintf(line, sizeof(line), "%s%d  %u.%u Hz",
+					 note_names[f.midi % 12], f.midi / 12 - 1,
+					 f.f0_dhz / 10, f.f0_dhz % 10);
+				cfb_print(disp, line, 0, 16);
+				snprintf(line, sizeof(line), "%+d cents", f.cents);
+				cfb_print(disp, line, 0, 32);
+				/* barra: | = afinado, * = posicao atual (6 c/passo) */
+				char bar[20] = "[-------|-------]";
+				int idx = 8 + f.cents / 6;
+
+				idx = CLAMP(idx, 1, 15);
+				bar[idx] = '*';
+				cfb_print(disp, bar, 0, 48);
+			} else {
+				cfb_print(disp, "---", 0, 16);
+				cfb_print(disp, "toque uma nota", 0, 32);
+			}
+		} else {
+			cfb_print(disp, "Analisador RT", 0, 0);
+			snprintf(line, sizeof(line), "nivel: %u", rt.level);
+			cfb_print(disp, line, 0, 16);
+			snprintf(line, sizeof(line), "modo: %s", mode_name[m]);
+			cfb_print(disp, line, 0, 32);
+			snprintf(line, sizeof(line), "fps: %u", rt.display_fps);
+			cfb_print(disp, line, 0, 48);
+		}
 		cfb_framebuffer_finalize(disp);
 	}
 }
@@ -310,10 +471,18 @@ static int cmd_rt_status(const struct shell *sh, size_t argc, char **argv)
 		    rt.fft_us_max);
 	shell_print(sh, "overruns=%u", rt.overruns);
 	shell_print(sh, "nivel(pico)=%u", rt.level);
-	shell_print(sh, "freq dominante=%u Hz", rt.dominant_hz);
+	if (g_latest.note_valid) {
+		shell_print(sh, "nota=%s%d  f0=%u.%u Hz  desvio=%+d cents",
+			    note_names[g_latest.midi % 12], g_latest.midi / 12 - 1,
+			    g_latest.f0_dhz / 10, g_latest.f0_dhz % 10,
+			    g_latest.cents);
+	} else {
+		shell_print(sh, "nota=--- (sem sinal periodico acima do limiar)");
+	}
 	shell_print(sh, "modo=%s", mode_name[atomic_get(&disp_mode)]);
 	if (rt.i2s_ok) {
-		shell_print(sh, "I2S=ok (deteccao de nota/FFT vem no passo 3)");
+		shell_print(sh, "I2S=ok  Fs real=%d.%d Hz", (int)FS_ACTUAL_HZ,
+			    (int)(FS_ACTUAL_HZ * 10) % 10);
 	} else {
 		shell_print(sh, "I2S=OFF (erro=%d)", rt.i2s_err);
 	}
@@ -329,7 +498,7 @@ static int cmd_rt_mode(const struct shell *sh, size_t argc, char **argv)
 			return 0;
 		}
 	}
-	shell_error(sh, "modo invalido: use spectrum | wave | stats");
+	shell_error(sh, "modo invalido: use tuner | spectrum | wave | stats");
 	return -EINVAL;
 }
 
@@ -372,6 +541,34 @@ static int cmd_rt_watch(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_rt_tune(const struct shell *sh, size_t argc, char **argv)
+{
+	int secs = (argc > 1) ? atoi(argv[1]) : 10;
+
+	secs = CLAMP(secs, 1, 60);
+	shell_print(sh, "afinador por %d s (toque uma nota; A4=440 Hz)...", secs);
+
+	for (int k = 0; k < secs * 2; k++) {
+		struct spectrum_frame f = g_latest;
+
+		if (f.note_valid) {
+			char bar[20] = "[-------|-------]";
+			int idx = 8 + f.cents / 6;
+
+			idx = CLAMP(idx, 1, 15);
+			bar[idx] = '*';
+			shell_print(sh, "%-2s%d  %4u.%u Hz  %+4d cents  %s",
+				    note_names[f.midi % 12], f.midi / 12 - 1,
+				    f.f0_dhz / 10, f.f0_dhz % 10, f.cents, bar);
+		} else {
+			shell_print(sh, "---");
+		}
+		k_sleep(K_MSEC(500));
+	}
+	shell_print(sh, "(fim)");
+	return 0;
+}
+
 static int cmd_rt_dump(const struct shell *sh, size_t argc, char **argv)
 {
 	shell_print(sh, "pico canal L=%u  R=%u  (I2S=%s)", g_peak_l, g_peak_r,
@@ -386,9 +583,11 @@ static int cmd_rt_dump(const struct shell *sh, size_t argc, char **argv)
 static int cmd_rt_help(const struct shell *sh, size_t argc, char **argv)
 {
 	shell_print(sh, "Analisador de espectro - comandos:");
-	shell_print(sh, "  rt status      metricas RT: Fs, N, tempo de FFT, fps, overruns, freq dominante");
+	shell_print(sh, "  rt status      metricas RT: Fs, N, tempo de processamento, fps, overruns");
+	shell_print(sh, "  rt tune [s]    afinador ao vivo por [s] segundos (nota + Hz + cents)");
 	shell_print(sh, "  rt watch [s]   espectro ao vivo por [s] segundos (padrao 5, termina sozinho)");
-	shell_print(sh, "  rt mode <m>    modo de exibicao: spectrum | wave | stats");
+	shell_print(sh, "  rt dump        amostras cruas do I2S (diagnostico)");
+	shell_print(sh, "  rt mode <m>    modo do display: tuner | spectrum | wave | stats");
 	shell_print(sh, "  rt help        esta ajuda");
 	shell_print(sh, "");
 	shell_print(sh, "Uteis do Zephyr:");
@@ -402,6 +601,7 @@ static int cmd_rt_help(const struct shell *sh, size_t argc, char **argv)
 SHELL_STATIC_SUBCMD_SET_CREATE(rt_sub,
 	SHELL_CMD(help, NULL, "Lista os comandos do analisador e o que fazem", cmd_rt_help),
 	SHELL_CMD(status, NULL, "Metricas de tempo real", cmd_rt_status),
+	SHELL_CMD_ARG(tune, NULL, "Afinador ao vivo: rt tune [s]", cmd_rt_tune, 1, 1),
 	SHELL_CMD(dump, NULL, "Amostras cruas do I2S (diagnostico)", cmd_rt_dump),
 	SHELL_CMD_ARG(watch, NULL, "Espectro ao vivo por N segundos: rt watch [s]",
 		      cmd_rt_watch, 1, 1),
