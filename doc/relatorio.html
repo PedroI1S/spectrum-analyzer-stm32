@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Analisador de Espectro de Áudio em Tempo Real — Relatório de Projeto</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    color: #1a1a1a; line-height: 1.55; font-size: 11pt;
+    max-width: 180mm; margin: 0 auto; padding: 8mm 0;
+  }
+  h1 { font-size: 20pt; margin: 0 0 2mm; line-height: 1.25; }
+  h2 { font-size: 14pt; margin: 9mm 0 3mm; border-bottom: 2px solid #2b5ea7; padding-bottom: 1mm; color: #2b5ea7; }
+  h3 { font-size: 11.5pt; margin: 5mm 0 2mm; color: #333; }
+  p { margin: 2mm 0; text-align: justify; }
+  .subtitle { color: #555; font-size: 12pt; margin-bottom: 1mm; }
+  .meta { color: #666; font-size: 10pt; }
+  .meta a { color: #2b5ea7; }
+  table { border-collapse: collapse; width: 100%; margin: 3mm 0; font-size: 9.5pt; }
+  th, td { border: 1px solid #bbb; padding: 1.6mm 2.5mm; text-align: left; vertical-align: top; }
+  th { background: #eef3fa; font-weight: 600; }
+  code, .mono { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9pt; background: #f4f4f4; padding: 0 1mm; border-radius: 2px; }
+  pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 8.6pt; background: #f4f4f4; border: 1px solid #ddd; border-radius: 3px; padding: 2.5mm; overflow-x: auto; line-height: 1.4; }
+  .fig { margin: 4mm 0; text-align: center; }
+  .fig svg { max-width: 100%; height: auto; }
+  .figcap { font-size: 9pt; color: #555; margin-top: 1.5mm; text-align: center; }
+  .ok { color: #1d7a34; font-weight: 600; }
+  .box { border: 1px solid #cdd9ea; background: #f6f9fd; border-radius: 3px; padding: 2.5mm 3.5mm; margin: 3mm 0; }
+  .warn { border-color: #e5c37a; background: #fdf8ec; }
+  ul, ol { margin: 2mm 0 2mm 5mm; padding-left: 4mm; }
+  li { margin: 1mm 0; }
+  .pagebreak { page-break-before: always; }
+  .cover { text-align: center; padding-top: 30mm; page-break-after: always; }
+  .cover h1 { font-size: 24pt; }
+  .cover .subtitle { font-size: 14pt; margin: 4mm 0; }
+  .cover .meta { font-size: 11pt; margin-top: 12mm; line-height: 2; }
+  .kpi { display: flex; gap: 4mm; margin: 4mm 0; }
+  .kpi > div { flex: 1; border: 1px solid #cdd9ea; border-radius: 3px; padding: 3mm; text-align: center; background: #f6f9fd; }
+  .kpi .num { font-size: 16pt; font-weight: 700; color: #2b5ea7; }
+  .kpi .lbl { font-size: 8.5pt; color: #555; }
+  @media print { body { padding: 0; } a { text-decoration: none; color: #2b5ea7; } }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <h1>Analisador de Espectro de Áudio<br>em Tempo Real</h1>
+  <div class="subtitle">com afinador cromático por autocorrelação</div>
+  <div class="subtitle" style="font-size:11pt; color:#777">Zephyr RTOS · STM32F4-Discovery (STM32F407VG) · INMP441 · SSD1306</div>
+  <div class="meta">
+    Disciplina: Sistemas de Tempo Real — Trabalho Final (Opção 1)<br>
+    Julho de 2026<br><br>
+    Repositório: <a href="https://github.com/PedroI1S/spectrum-analyzer-stm32">github.com/PedroI1S/spectrum-analyzer-stm32</a>
+  </div>
+  <div class="kpi" style="margin-top:22mm">
+    <div><div class="num">4 µs</div><div class="lbl">jitter pico-a-pico<br>(1100 blocos)</div></div>
+    <div><div class="num">0</div><div class="lbl">overruns em<br>operação normal</div></div>
+    <div><div class="num">42%</div><div class="lbl">folga de deadline<br>(18,4 / 31,9 ms)</div></div>
+    <div><div class="num">E2–D7</div><div class="lbl">faixa do afinador<br>(82–2349 Hz)</div></div>
+  </div>
+</div>
+
+<h2>1. Visão geral</h2>
+<p>O sistema captura áudio por um microfone digital I2S, calcula em tempo real a fundamental
+(afinador) e o espectro (FFT), e exibe os resultados num display OLED — funcionando de forma
+autônoma, sem PC. Um shell acessível por SEGGER RTT (sobre o próprio ST-LINK da placa) permite
+inspecionar o estado do sistema e as métricas de tempo real sem interferir nas tarefas.</p>
+<pre>INMP441 (I2S) ──DMA──▶ buffer ──▶ autocorrelação (pitch) + FFT (CMSIS-DSP) ──▶ OLED SSD1306
+                                          │
+                                          └──▶ métricas RT ──▶ shell RTT (rt status / rt jitter)</pre>
+<p>A aplicação demonstra uma tarefa <b>hard real-time</b> (aquisição + DSP, com taxa de amostragem
+sem jitter e deadline por bloco) e uma tarefa <b>soft real-time</b> (atualização da tela). Toda a
+sincronização usa objetos do Zephyr — <b>não há polling</b> no código de aplicação.</p>
+
+<h2>2. Hardware e ligações</h2>
+<table>
+  <tr><th>Item</th><th>Especificação</th><th>Função</th></tr>
+  <tr><td>Placa</td><td>STM32F4-Discovery — STM32F407VG, Cortex-M4F @ 168 MHz, 1 MiB flash, 192 KiB RAM</td><td>Processamento</td></tr>
+  <tr><td>Microfone</td><td>INMP441 — MEMS I2S, 24 bits, 3,3 V</td><td>Aquisição (hard RT)</td></tr>
+  <tr><td>Display</td><td>OLED 0,96&quot; 128×64, SSD1306, I²C (endereço 0x3C)</td><td>Visualização (soft RT)</td></tr>
+  <tr><td>Console</td><td><b>SEGGER RTT sobre o ST-LINK</b> embutido — sem hardware extra</td><td>Shell / métricas</td></tr>
+</table>
+
+<div class="fig">
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="12">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1L9 5L1 9" fill="none" stroke="#666" stroke-width="1.6"/></marker></defs>
+  <rect x="270" y="20" width="160" height="260" rx="10" fill="#e8f0fe" stroke="#2b5ea7"/>
+  <text x="350" y="44" text-anchor="middle" font-weight="bold" fill="#1a3d6e">STM32F4-Discovery</text>
+  <text x="350" y="60" text-anchor="middle" fill="#456" font-size="10">STM32F407VG</text>
+  <rect x="30" y="80" width="150" height="130" rx="10" fill="#e2f4ef" stroke="#1d8a70"/>
+  <text x="105" y="102" text-anchor="middle" font-weight="bold" fill="#115c4a">INMP441</text>
+  <text x="105" y="117" text-anchor="middle" fill="#456" font-size="10">mic I2S · 24 bits</text>
+  <g stroke="#666" marker-end="url(#ar)">
+    <line x1="180" y1="135" x2="268" y2="135"/><line x1="180" y1="157" x2="268" y2="157"/>
+    <line x1="180" y1="179" x2="268" y2="179"/><line x1="180" y1="201" x2="268" y2="201"/>
+  </g>
+  <g fill="#333" font-size="10">
+    <text x="224" y="130" text-anchor="middle">SCK · PB13</text>
+    <text x="224" y="152" text-anchor="middle">WS · PB12</text>
+    <text x="224" y="174" text-anchor="middle">SD · PB15</text>
+    <text x="224" y="196" text-anchor="middle">L/R · GND</text>
+  </g>
+  <rect x="520" y="120" width="150" height="110" rx="10" fill="#fdf3e0" stroke="#c08a1e"/>
+  <text x="595" y="143" text-anchor="middle" font-weight="bold" fill="#7c5808">SSD1306</text>
+  <text x="595" y="158" text-anchor="middle" fill="#456" font-size="10">OLED 128×64 · 0x3C</text>
+  <g stroke="#666" marker-end="url(#ar)"><line x1="430" y1="180" x2="518" y2="180"/><line x1="430" y1="205" x2="518" y2="205"/></g>
+  <g fill="#333" font-size="10">
+    <text x="474" y="175" text-anchor="middle">SCL · PB6</text>
+    <text x="474" y="200" text-anchor="middle">SDA · PB9</text>
+  </g>
+  <text x="350" y="262" text-anchor="middle" fill="#456" font-size="10">VDD/VCC = 3V3 · GND comum · I²C1 compartilhado com o codec CS43L22 (0x4A)</text>
+</svg>
+<div class="figcap">Figura 1 — Ligações. O CAN2 (que ocupa o PB13 no devicetree do board) é desabilitado por software.
+O console não usa fios: RTT sobre o cabo USB do ST-LINK.</div>
+</div>
+
+<h2>3. Arquitetura de software</h2>
+<table>
+  <tr><th>Tarefa</th><th>Classe RT</th><th>Prioridade</th><th>Disparo (sem polling)</th><th>Responsabilidade</th></tr>
+  <tr><td><code>acq_fft</code></td><td><b>Hard</b></td><td>2</td><td><code>i2s_read()</code> bloqueia até o DMA entregar um bloco</td><td>Recombina amostras, autocorrelação (pitch), FFT, métricas; publica frame</td></tr>
+  <tr><td><code>display</code></td><td><b>Soft</b></td><td>7</td><td><code>k_msgq</code> (fila de frames)</td><td>Desenha o último frame no OLED (CFB), ~20 fps</td></tr>
+  <tr><td><code>blink</code></td><td>Referência</td><td>(k_timer)</td><td><code>k_timer</code> 500 ms</td><td>LED LD4 a 1 Hz — referência visual de temporização</td></tr>
+  <tr><td><code>button</code></td><td>Evento</td><td>(sysworkq)</td><td>IRQ de GPIO → <code>k_work</code></td><td>Cicla o modo de exibição</td></tr>
+  <tr><td><code>shell_rtt</code></td><td>Soft</td><td>14</td><td>Subsistema shell (eventos)</td><td>Comandos <code>rt …</code> e <code>kernel …</code> — leitura não intrusiva</td></tr>
+</table>
+
+<div class="fig">
+<svg viewBox="0 0 700 330" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="12">
+  <defs><marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1L9 5L1 9" fill="none" stroke="#666" stroke-width="1.6"/></marker></defs>
+  <rect x="20" y="40" width="105" height="52" rx="8" fill="#e2f4ef" stroke="#1d8a70"/>
+  <text x="72" y="62" text-anchor="middle" font-weight="bold" fill="#115c4a" font-size="11">INMP441</text>
+  <text x="72" y="78" text-anchor="middle" fill="#456" font-size="9.5">mic I2S</text>
+  <rect x="160" y="40" width="115" height="52" rx="8" fill="#eee" stroke="#888"/>
+  <text x="217" y="62" text-anchor="middle" font-weight="bold" fill="#444" font-size="11">I2S2 + DMA1</text>
+  <text x="217" y="78" text-anchor="middle" fill="#456" font-size="9.5">clock por hardware</text>
+  <rect x="310" y="30" width="150" height="72" rx="8" fill="#fdeaea" stroke="#b23b3b"/>
+  <text x="385" y="52" text-anchor="middle" font-weight="bold" fill="#7c1f1f" font-size="11">acq_fft (hard, prio 2)</text>
+  <text x="385" y="68" text-anchor="middle" fill="#456" font-size="9.5">recombina 24 bits · ACF</text>
+  <text x="385" y="82" text-anchor="middle" fill="#456" font-size="9.5">FFT 512 · métricas RT</text>
+  <rect x="495" y="40" width="80" height="52" rx="8" fill="#eef" stroke="#66a"/>
+  <text x="535" y="62" text-anchor="middle" font-weight="bold" fill="#334" font-size="10.5">k_msgq</text>
+  <text x="535" y="78" text-anchor="middle" fill="#456" font-size="9.5">4 frames</text>
+  <rect x="310" y="150" width="150" height="62" rx="8" fill="#e8f0fe" stroke="#2b5ea7"/>
+  <text x="385" y="172" text-anchor="middle" font-weight="bold" fill="#1a3d6e" font-size="11">display (soft, prio 7)</text>
+  <text x="385" y="188" text-anchor="middle" fill="#456" font-size="9.5">tuner · spectrum · wave · stats</text>
+  <text x="385" y="202" text-anchor="middle" fill="#456" font-size="9.5">CFB ~20 fps</text>
+  <rect x="520" y="150" width="120" height="62" rx="8" fill="#fdf3e0" stroke="#c08a1e"/>
+  <text x="580" y="176" text-anchor="middle" font-weight="bold" fill="#7c5808" font-size="11">OLED SSD1306</text>
+  <text x="580" y="192" text-anchor="middle" fill="#456" font-size="9.5">I2C1 @ 400 kHz</text>
+  <rect x="20" y="150" width="110" height="52" rx="8" fill="#f2eafa" stroke="#7a4bb2"/>
+  <text x="75" y="172" text-anchor="middle" font-weight="bold" fill="#4b2a73" font-size="10.5">botão B1 (PA0)</text>
+  <text x="75" y="188" text-anchor="middle" fill="#456" font-size="9.5">IRQ → k_work</text>
+  <rect x="20" y="240" width="110" height="52" rx="8" fill="#f2eafa" stroke="#7a4bb2"/>
+  <text x="75" y="262" text-anchor="middle" font-weight="bold" fill="#4b2a73" font-size="10.5">k_timer 500 ms</text>
+  <text x="75" y="278" text-anchor="middle" fill="#456" font-size="9.5">LED LD4 (blink)</text>
+  <rect x="310" y="240" width="150" height="52" rx="8" fill="#eee" stroke="#888"/>
+  <text x="385" y="262" text-anchor="middle" font-weight="bold" fill="#444" font-size="10.5">shell_rtt (prio 14)</text>
+  <text x="385" y="278" text-anchor="middle" fill="#456" font-size="9.5">rt status/tune/jitter/sens…</text>
+  <rect x="520" y="240" width="120" height="52" rx="8" fill="#eee" stroke="#888"/>
+  <text x="580" y="262" text-anchor="middle" font-weight="bold" fill="#444" font-size="10.5">host (RTT)</text>
+  <text x="580" y="278" text-anchor="middle" fill="#456" font-size="9.5">via ST-LINK/SWD</text>
+  <g stroke="#666" marker-end="url(#ar2)" fill="none">
+    <line x1="125" y1="66" x2="158" y2="66"/>
+    <line x1="275" y1="66" x2="308" y2="66"/>
+    <line x1="460" y1="66" x2="493" y2="66"/>
+    <path d="M535 92 L535 120 L460 120 L420 148"/>
+    <line x1="460" y1="181" x2="518" y2="181"/>
+    <path d="M130 176 L308 176" stroke-dasharray="4 3"/>
+    <path d="M460 266 L518 266"/>
+    <path d="M385 214 L385 238" stroke-dasharray="4 3"/>
+  </g>
+  <text x="220" y="170" text-anchor="middle" fill="#666" font-size="9">troca modo (atomic)</text>
+  <text x="385" y="230" text-anchor="middle" fill="#666" font-size="9">lê métricas (não intrusivo)</text>
+  <text x="291" y="58" text-anchor="middle" fill="#666" font-size="9">blocos</text>
+</svg>
+<div class="figcap">Figura 2 — Arquitetura: fluxo de dados (linhas cheias) e interações assíncronas (tracejadas).
+O <code>i2s_read()</code> bloqueante é o “relógio” da tarefa hard; nenhuma tarefa faz polling.</div>
+</div>
+
+<h2 class="pagebreak">4. Análise de tempo real</h2>
+<h3>4.1 Tarefa hard — aquisição + DSP</h3>
+<p>O requisito duro é a <b>taxa de amostragem constante</b>: o relógio do I2S é gerado por hardware
+(PLLI2S → prescaler do periférico) e o DMA move as amostras sem intervenção da CPU. Cada bloco de
+512 amostras impõe um <i>deadline</i>: todo o processamento (autocorrelação + FFT) precisa terminar
+antes do próximo bloco — caso contrário há <i>overrun</i> (contado e exposto no shell).</p>
+<h3>4.2 Medições na placa (comando <code>rt jitter</code>)</h3>
+<table>
+  <tr><th>Métrica</th><th>Valor medido</th><th>Observação</th></tr>
+  <tr><td>Período nominal do bloco</td><td>31.922 µs</td><td>512 amostras / 16.039,3 Hz</td></tr>
+  <tr><td>Período medido (n = 1100 blocos, 30 s)</td><td>mín 31.918 · médio 31.919 · máx 31.922 µs</td><td>medido com <code>k_cycle_get_32()</code> na chegada de cada bloco</td></tr>
+  <tr><td><b>Jitter pico-a-pico</b></td><td class="ok">4 µs (0,01% do período)</td><td>inclui a latência de escalonamento — é o que a aplicação vê</td></tr>
+  <tr><td>Tempo de processamento (ACF+FFT)</td><td>máx 18,4 ms</td><td class="ok">deadline de 31,9 ms com 42% de folga</td></tr>
+  <tr><td>Overruns</td><td class="ok">0</td><td>em operação normal, com display e shell ativos</td></tr>
+  <tr><td>FFT isolada (512 pts, f32)</td><td>~0,5 ms</td><td>CMSIS-DSP com FPU</td></tr>
+</table>
+<div class="box"><b>Por que o jitter é desprezível:</b> a amostragem é <i>hardware-timed</i> — o
+jitter de amostragem propriamente dito é nulo (clock I2S contínuo) e o que se mede é apenas a
+variação na <i>entrega</i> dos blocos à thread, dominada pelo escalonador. Como a <code>acq_fft</code>
+tem prioridade máxima entre as threads de aplicação, essa variação fica em poucos µs.</div>
+<h3>4.3 Tarefa soft — display</h3>
+<p>A thread <code>display</code> desenha sempre o frame mais recente. Se atrasar, nenhum dado de
+áudio é perdido (o DMA continua e a fila descarta o frame mais antigo) — comportamento soft por
+construção. Taxa medida: ~20 fps (limite prático do I²C a 400 kHz ≈ 30 fps).</p>
+
+<h2>5. Processamento de sinal</h2>
+<h3>5.1 Afinador (autocorrelação)</h3>
+<ul>
+  <li><b>Método:</b> autocorrelação numa janela deslizante de 1024 amostras (64 ms) — robusta aos
+  harmônicos fortes de cordas (o maior pico da FFT frequentemente é um harmônico, não a fundamental).</li>
+  <li><b>Fundamental:</b> primeiro pico local ≥ 85% do máximo da ACF (evita cair no múltiplo do
+  período); <b>interpolação parabólica</b> dá resolução sub-amostra.</li>
+  <li><b>Calibração de Fs:</b> a Fs real é <b>16.039,3 Hz</b> (o driver arredonda o prescaler do
+  PLLI2S de 135,5 MHz para 132). Usar os 16 kHz nominais causaria ~4 cents de erro sistemático.</li>
+  <li><b>Faixa validada empiricamente: E2 a D7 (82–2349 Hz)</b>; teto teórico ~2670 Hz (lag mínimo
+  de 6 amostras). Na borda do alcance a ACF erra por uma oitava — observado e corrigido (ver §7).</li>
+  <li><b>Sensibilidade em 3 níveis</b> (<code>rt sens alta|media|baixa</code>): gate de nível
+  15k/50k/150k (pico 24 bits) + rigor da ACF 25/30/35%.</li>
+  <li><b>Saída:</b> nota (A4 = 440 Hz), frequência e desvio em <i>cents</i>, com barra de afinação
+  no OLED e comando <code>rt tune [s]</code> no shell.</li>
+</ul>
+<h3>5.2 Espectro (FFT)</h3>
+<ul>
+  <li><code>arm_rfft_fast_f32</code> de 512 pontos com janela de Hann + <code>arm_cmplx_mag_f32</code>
+  (CMSIS-DSP), ~0,5 ms por bloco;</li>
+  <li>256 bins agrupados em <b>32 bandas em progressão geométrica</b> (eixo log de frequência);</li>
+  <li>magnitude em dB (piso 80 / topo 175 dB) → barras 0–63 px, tela cheia, ~20 fps;</li>
+  <li>bin DC descartado; frequência dominante = f0 do afinador quando há nota (mais precisa),
+  senão o bin de maior magnitude.</li>
+</ul>
+<h3>5.3 Modo osciloscópio (wave)</h3>
+<p>16 ms de sinal por tela (256 amostras), <b>gatilho por cruzamento de zero</b> (estabiliza a forma
+de onda) e <b>ganho vertical automático</b> pelo pico recente — detalhes visíveis em qualquer volume.</p>
+
+<h2>6. Interface</h2>
+<table>
+  <tr><th>Modo (botão B1 cicla)</th><th>Conteúdo no OLED</th></tr>
+  <tr><td>🎸 <b>tuner</b> (padrão)</td><td>Nota + oitava, frequência (0,1 Hz), desvio em cents e barra de afinação</td></tr>
+  <tr><td>📊 <b>spectrum</b></td><td>32 barras log/dB em tela cheia</td></tr>
+  <tr><td>〰 <b>wave</b></td><td>Forma de onda com gatilho e ganho automático</td></tr>
+  <tr><td>📈 <b>stats</b></td><td>fps, overruns, tempo de processamento, período e jitter</td></tr>
+</table>
+<table>
+  <tr><th>Comando do shell (RTT)</th><th>Função</th></tr>
+  <tr><td><code>rt status</code></td><td>Métricas gerais: Fs, frames, fps, tempos, nível, nota, sensibilidade, período/jitter</td></tr>
+  <tr><td><code>rt tune [s]</code></td><td>Afinador ao vivo no terminal por N segundos</td></tr>
+  <tr><td><code>rt jitter [reset]</code></td><td>Estatísticas do período de bloco + veredito do deadline</td></tr>
+  <tr><td><code>rt sens &lt;alta|media|baixa&gt;</code></td><td>Sensibilidade do afinador</td></tr>
+  <tr><td><code>rt watch [s]</code> / <code>rt dump</code></td><td>Espectro ASCII ao vivo / amostras cruas (diagnóstico)</td></tr>
+  <tr><td><code>rt mode &lt;m&gt;</code> / <code>rt help</code></td><td>Troca o modo do display / ajuda</td></tr>
+  <tr><td><code>kernel thread list</code>, <code>kernel stacks</code></td><td>Threads, prioridades, estados e uso de pilha (nativos do Zephyr)</td></tr>
+</table>
+<p><b>Não intrusividade:</b> o shell roda em thread própria (prioridade 14) e apenas <i>lê</i>
+variáveis atualizadas pelas tarefas de tempo real — nunca bloqueia o caminho hard.</p>
+
+<h2 class="pagebreak">7. Problemas encontrados e lições aprendidas</h2>
+<div class="box warn">
+<b>7.1 — Include errado de devicetree corrompeu o clock do I2S.</b> Incluir o header genérico
+<code>stm32_clock.h</code> junto com <code>stm32f4_clock.h</code> no overlay fez
+<code>STM32_CLOCK_BUS_APB1</code> expandir para <code>0x2</code> em vez de <code>0x040</code> — o
+driver escrevia no registrador errado e a init falhava com <code>-EIO</code> (device not ready).
+<i>Lição: usar somente o header da família do SoC (o mesmo que o dtsi usa).</i></div>
+<div class="box warn">
+<b>7.2 — Amostras I2S chegam partidas em metades de 16 bits.</b> O registrador de dados do I2S no
+F4 é de 16 bits; com slots de 24/32 bits, cada amostra chega em duas metades que o DMA (configurado
+em words de 32 pelo driver) grava zero-estendidas em words separados: layout real
+<code>[Lhi, Llo, Rhi, Rlo]</code>. Sintomas: taxa 2×, padrão <code>[dado, dado, 0, 0]</code>, nível
+“travado” em 255. Correção no aplicativo: recombinar <code>((hi&lt;&lt;16)|lo) &gt;&gt; 8</code> →
+24 bits com sinal. <i>Diagnóstico: comando <code>rt dump</code> + analisador lógico (confirmou os
+24 bits no barramento).</i></div>
+<div class="box warn">
+<b>7.3 — Travamento por falta de FPU sharing.</b> Quando a thread <code>display</code> passou a usar
+<code>float</code> (além da <code>acq_fft</code>), a placa congelava: com <code>CONFIG_FPU=y</code>
+mas sem <code>CONFIG_FPU_SHARING=y</code>, os registradores do FPU não são salvos no context switch
+e duas threads com float corrompem o estado. <i>Lição clássica de RTOS: FPU + multithreading exigem
+FPU sharing.</i></div>
+<div class="box warn">
+<b>7.4 — Deadline estourado por janela grande demais.</b> A ACF com janela de 2048 amostras levava
+~43 ms &gt; deadline de 32 ms. Reduzida para 1024 (64 ms de sinal, ainda &gt;5 períodos do E2):
+~18 ms, com 42% de folga. <i>Medir cedo o tempo de processamento evitou overruns em produção.</i></div>
+<div class="box warn">
+<b>7.5 — Erro de oitava na borda do alcance do afinador.</b> Com lag mínimo = 12 (teto 1337 Hz),
+notas na borda (E6 = 1319 Hz) eram lidas uma oitava abaixo: o pico do período real caía fora da
+janela de busca e o detector achava o de 2× o período. Corrigido estendendo o lag mínimo para 6
+(teto ~2670 Hz); faixa validada até D7. <i>Encontrado em teste empírico com variação de tom.</i></div>
+
+<h2>8. Uso de recursos</h2>
+<table>
+  <tr><th>Recurso</th><th>Uso</th><th>Percentual</th></tr>
+  <tr><td>FLASH</td><td>197.840 / 1.048.576 B</td><td>18,9% (inclui tabelas da FFT do CMSIS-DSP)</td></tr>
+  <tr><td>RAM</td><td>79.756 / 131.072 B</td><td>60,9% (buffers de DMA 24 KiB + janelas/FFT ~15 KiB + heap do display)</td></tr>
+  <tr><td>CPU (pior caso por bloco)</td><td>18,4 ms / 31,9 ms</td><td>~58% na thread hard; display/shell nos ~42% restantes</td></tr>
+</table>
+
+<h2>9. Checklist do enunciado</h2>
+<table>
+  <tr><th>Requisito</th><th>Entrega no projeto</th><th>✔</th></tr>
+  <tr><td>≥ 1 tarefa hard real-time</td><td><code>acq_fft</code> — aquisição + DSP com deadline por bloco, jitter medido de 4 µs</td><td class="ok">✔</td></tr>
+  <tr><td>≥ 1 tarefa soft real-time</td><td><code>display</code> — sempre o frame mais recente; perder frame não corrompe nada</td><td class="ok">✔</td></tr>
+  <tr><td>Console/shell com info do sistema</td><td>Shell por RTT: <code>kernel thread list</code>, <code>kernel stacks</code>, <code>rt …</code></td><td class="ok">✔</td></tr>
+  <tr><td>Comando com info das tarefas de RT</td><td><code>rt status</code> e <code>rt jitter</code> (períodos, deadline, overruns)</td><td class="ok">✔</td></tr>
+  <tr><td>Impressão não intrusiva</td><td>Shell em thread própria lendo variáveis; log pelo backend do shell</td><td class="ok">✔</td></tr>
+  <tr><td>Tarefa para piscar LED</td><td><code>k_timer</code> → LD4 a 1 Hz</td><td class="ok">✔</td></tr>
+  <tr><td>Tarefa acionada por botão</td><td>IRQ de GPIO → work queue → troca de modo</td><td class="ok">✔</td></tr>
+  <tr><td>Sem polling</td><td><code>i2s_read</code> bloqueante, msgq, work queue, timers</td><td class="ok">✔</td></tr>
+  <tr><td>RTOS ≠ FreeRTOS</td><td>Zephyr RTOS (v4.4-dev)</td><td class="ok">✔</td></tr>
+</table>
+
+<h2>10. Como reproduzir</h2>
+<pre># dependências de host (macOS): brew install openocd stlink dtc cmake ninja gperf
+python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+pip install west
+west init -l . &amp;&amp; west update           # a partir da raiz do repositório
+west zephyr-export &amp;&amp; pip install -r ../zephyr/scripts/requirements.txt
+west sdk install -t arm-zephyr-eabi
+
+west build -b stm32f4_disco app          # compilar
+west flash -d build --runner openocd     # gravar (runner padrão exige STM32CubeProgrammer)
+./scripts/rtt-console.sh                 # console RTT interativo (rt help)</pre>
+
+<h2>11. Conclusão</h2>
+<p>O projeto cumpre integralmente o enunciado e vai além: além do analisador de espectro planejado,
+entrega um afinador cromático validado com instrumento real numa faixa de quase cinco oitavas.
+As medições na placa comprovam o comportamento de tempo real — jitter de entrega de 4 µs
+(amostragem <i>hardware-timed</i> com jitter nulo), deadline cumprido com 42% de folga e zero
+overruns em operação contínua. Os cinco problemas não triviais encontrados (devicetree, framing do
+I2S, FPU sharing, dimensionamento de janela vs. deadline e limite de alcance da autocorrelação)
+foram diagnosticados com instrumentos adequados (shell RTT, analisador lógico) e documentados —
+constituindo, na prática, o principal aprendizado de sistemas embarcados de tempo real do trabalho.</p>
+
+<p class="meta" style="margin-top:8mm; border-top:1px solid #ccc; padding-top:2mm">
+Relatório gerado em julho de 2026 · código-fonte e histórico completo em
+<a href="https://github.com/PedroI1S/spectrum-analyzer-stm32">github.com/PedroI1S/spectrum-analyzer-stm32</a>
+· Para gerar o PDF: abrir este arquivo no navegador e imprimir (⌘P → “Salvar como PDF”).</p>
+
+</body>
+</html>
