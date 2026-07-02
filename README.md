@@ -28,7 +28,11 @@ completo está em [`plano_projeto_analisador_espectro_zephyr.md`](plano_projeto_
 - ✅ **F3 (afinador) concluído** — detector de nota por autocorrelação (Fs calibrada 16039,3 Hz,
   interpolação parabólica): modo `tuner` no OLED (nota + Hz + cents + barra de afinação) e comando
   `rt tune [s]`. Validado com instrumento — estável, 0 overruns, dentro do deadline hard-RT.
-- ⏳ Próximo (F4): espectro real no display — FFT com CMSIS-DSP, barras + modos wave/spectrum. Ver §11 e §15 do plano.
+- ✅ **F4 (espectro/onda) concluído** — FFT 512 (CMSIS-DSP, janela de Hann) → 32 barras log/dB
+  em tela cheia a ~20 fps; modo `wave` = mini-osciloscópio (16 ms, gatilho por cruzamento de zero,
+  ganho automático). Botão azul cicla: tuner → spectrum → wave → stats. Bug clássico documentado:
+  float em duas threads exige `CONFIG_FPU_SHARING=y` (sem isso a placa trava).
+- ⏳ Próximo (F6): métricas de jitter, documentação final e vídeo de demo. Ver §11 e §15 do plano.
 
 ## Como construir, gravar e ver o console
 

@@ -257,7 +257,7 @@ Ajustar as semanas ao prazo real da disciplina.
 | F1 — Display | OLED desenha texto/figuras de teste | **✅ concluído:** SSD1306 (I2C1 @ 0x3c) desenhando via CFB — mostra f0/modo/fps. Barras graficas ficam para a F4 |
 | F2 — Aquisição I2S | INMP441 lê amostras via DMA | **✅ concluído (aquisição):** I2S2+DMA capturando a 16 kHz, amostras 24-bit coerentes (silêncio = ruído baixo; R=0 com L/R=GND); fps=31, 0 overruns. Ver §15.5 para os 2 bugs achados |
 | F3 — DSP | FFT + magnitudes + janela | **✅ concluído (pitch/afinador):** detecção da fundamental por autocorrelação (janela 1024, interpolação parabólica, Fs calibrada 16039,3 Hz) → nota + cents no OLED e `rt tune`; estável, sem overruns, dentro do deadline. FFT em barras p/ o espectro fica na F4 |
-| F4 — Integração | Espectro ao vivo no OLED; tarefas hard/soft separadas | Espectro responde ao som em tempo real |
+| F4 — Integração | Espectro ao vivo no OLED; tarefas hard/soft separadas | **✅ concluído:** FFT 512 (CMSIS-DSP) → 32 barras log/dB em tela cheia a ~20 fps; modo wave = mini-osciloscópio (16 ms, gatilho de cruzamento de zero, ganho automático). FFT ~0,5 ms; ACF+FFT dentro do deadline; 0 overruns |
 | F5 — Interação | Botão troca telas; LED como referência; comandos `rt …` | Três telas funcionam; shell mostra métricas RT |
 | F6 — Robustez & doc | Medição de jitter/overruns; README; vídeo de demo | Sem overruns em operação normal; documentação pronta |
 
@@ -344,7 +344,9 @@ west flash -d build --runner openocd # runner padrao tenta STM32CubeProgrammer; 
 - **Pinout confirmado (contra o board dts):** mic INMP441 no **I2S2** (CK=PB13, WS=PB12, SD=PB15, L/R=GND); OLED no **I2C1** (PB6/PB9). Obs: PB13 é do CAN2 no board → `&can2` desabilitado no overlay.
 - ✅ **F2 (aquisição) concluída** — I2S2 + DMA capturando o INMP441 a 16 kHz, 24 bits corretos, 0 overruns. Ver §15.5.
 - ✅ **F3 (pitch/afinador) concluída** — detector de nota por **autocorrelação** na thread hard-RT: janela deslizante de 1024 amostras (64 ms), primeiro pico ≥85% do máximo (robusto a harmônicos), interpolação parabólica (precisão sub-amostra), gate de nível + gate de qualidade. **Fs calibrada = 16039,3 Hz** (o prescaler do I2S arredonda: PLLI2S 135,5 MHz/132/64 — usar 16000 nominal daria ~4 cents de erro sistemático). Modo `tuner` no display (nota, Hz, cents e barra de afinação) + comando `rt tune [s]`. Lição de RT: janela de 2048 estourava o deadline (ACF ~43 ms > bloco de 32 ms) → reduzida para 1024. Validado com instrumento: estável, 0 overruns.
-- **F4 — Espectro:** FFT em barras para o display (CMSIS-DSP: `west config manifest.project-filter -- +cmsis-dsp`), modos wave/spectrum reais.
+- ✅ **F4 (espectro/onda) concluída** — módulo `cmsis-dsp` adicionado à allowlist do `west.yml` (com allowlist, o `project-filter` sugerido na §7.1 não se aplica). FFT real de 512 pontos com janela de Hann (`arm_rfft_fast_f32` + `arm_cmplx_mag_f32`, ~0,5 ms), 32 bandas em progressão geométrica, magnitude em dB (piso 80 / topo 175 dB) → barras em tela cheia a ~20 fps. Modo `wave` = mini-osciloscópio: 16 ms de sinal, gatilho por cruzamento de zero e ganho vertical automático. Freq. dominante = f0 do afinador quando há nota (mais precisa), senão o bin dominante da FFT.
+- **Bug clássico de RTOS encontrado:** ao usar float na thread `display` (que antes só fazia inteiros), a placa travava — com `CONFIG_FPU=y` sem `CONFIG_FPU_SHARING=y`, os registradores do FPU não são salvos no context switch e duas threads com float corrompem o estado. Correção: `CONFIG_FPU_SHARING=y`. Lição: FPU + multithreading exigem FPU sharing.
+- **F6 — Robustez/doc:** métricas de jitter, README final, vídeo de demo.
 
 ### 15.5 Bugs encontrados na F2 (registro técnico)
 
