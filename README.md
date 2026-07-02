@@ -25,7 +25,10 @@ completo está em [`plano_projeto_analisador_espectro_zephyr.md`](plano_projeto_
 - ✅ **F2 (aquisição) concluído** — INMP441 no I2S2 (CK=PB13, WS=PB12, SD=PB15) via DMA a 16 kHz,
   amostras 24-bit corretas, 0 overruns. Dois bugs não-óbvios documentados no §15.5 do plano
   (include de clock errado no overlay; amostras chegam em metades de 16 bits e são recombinadas no app).
-- ⏳ Próximo (F3): detector de nota/afinador por autocorrelação (nota + cents no OLED) e, depois, FFT (CMSIS-DSP). Ver §11 e §15 do plano.
+- ✅ **F3 (afinador) concluído** — detector de nota por autocorrelação (Fs calibrada 16039,3 Hz,
+  interpolação parabólica): modo `tuner` no OLED (nota + Hz + cents + barra de afinação) e comando
+  `rt tune [s]`. Validado com instrumento — estável, 0 overruns, dentro do deadline hard-RT.
+- ⏳ Próximo (F4): espectro real no display — FFT com CMSIS-DSP, barras + modos wave/spectrum. Ver §11 e §15 do plano.
 
 ## Como construir, gravar e ver o console
 
