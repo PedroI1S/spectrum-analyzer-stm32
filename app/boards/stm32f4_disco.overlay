@@ -9,11 +9,12 @@
  *   pull-ups. O codec de audio CS43L22 (0x4a) compartilha esse barramento -
  *   sem conflito, pois os enderecos sao distintos (OLED = 0x3c).
  *
- * Fase F2 (a fazer): microfone INMP441 no I2S2 (CK=PB13, WS=PB12, SD=PB15).
- *   Como PB13 e usado pelo CAN2 no board, sera preciso desabilita-lo aqui:
- *     &can2 { status = "disabled"; };
- *   e habilitar &i2s2 com o clock PLLI2S e o canal de DMA RX.
+ * Fase F2: microfone INMP441 no I2S2 (CK=PB13, WS=PB12, SD=PB15). O CAN2 usa
+ *   PB13 no board, entao e desabilitado aqui; o &i2s2 e habilitado com a fonte
+ *   de clock PLLI2S (o canal de DMA RX ja vem do SoC dtsi).
  */
+
+#include <zephyr/dt-bindings/clock/stm32f4_clock.h>
 
 &i2c1 {
 	ssd1306: ssd1306@3c {
@@ -35,4 +36,18 @@
 	chosen {
 		zephyr,display = &ssd1306;
 	};
+};
+
+/* CAN2 ocupa o PB13 no board; liberamos para o I2S2_CK */
+&can2 {
+	status = "disabled";
+};
+
+/* microfone INMP441: I2S2 mestre-receptor (CK=PB13, WS=PB12, SD=PB15) */
+&i2s2 {
+	pinctrl-0 = <&i2s2_ck_pb13 &i2s2_ws_pb12 &i2s2_sd_pb15>;
+	pinctrl-names = "default";
+	clocks = <&rcc STM32_CLOCK(APB1, 14)>,
+		 <&rcc STM32_SRC_PLLI2S_R I2S_SEL(0)>;
+	status = "okay";
 };

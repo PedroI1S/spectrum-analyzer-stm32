@@ -255,7 +255,7 @@ Ajustar as semanas ao prazo real da disciplina.
 |---|---|---|
 | F0 — Bring-up | Projeto Zephyr compila e `blinky` roda; shell responde | **✅ concluído:** compila/grava, LED pisca (`k_timer`), botão troca modo (IRQ→work), shell por RTT responde (`kernel thread list`, `kernel stacks`, `rt status`, `rt mode`). Esqueleto RT do §4 implementado e validado. Ver §15 |
 | F1 — Display | OLED desenha texto/figuras de teste | **✅ concluído:** SSD1306 (I2C1 @ 0x3c) desenhando via CFB — mostra f0/modo/fps. Barras graficas ficam para a F4 |
-| F2 — Aquisição I2S | INMP441 lê amostras via DMA | Amostras coerentes (silêncio ≈ 0; tom → senoide); SCK/WS no osciloscópio |
+| F2 — Aquisição I2S | INMP441 lê amostras via DMA | **✅ concluído (aquisição):** I2S2+DMA capturando a 16 kHz, amostras 24-bit coerentes (silêncio = ruído baixo; R=0 com L/R=GND); fps=31, 0 overruns. Ver §15.5 para os 2 bugs achados |
 | F3 — DSP | FFT + magnitudes + janela | Tom de 1 kHz → pico no bin correto; frequência dominante correta |
 | F4 — Integração | Espectro ao vivo no OLED; tarefas hard/soft separadas | Espectro responde ao som em tempo real |
 | F5 — Interação | Botão troca telas; LED como referência; comandos `rt …` | Três telas funcionam; shell mostra métricas RT |
@@ -341,7 +341,13 @@ west flash -d build --runner openocd # runner padrao tenta STM32CubeProgrammer; 
 
 - ✅ **F0 concluído** (shell por RTT + esqueleto RT validado — ver §15.1).
 - ✅ **F1 concluído** — SSD1306 no I2C1 (SCL=PB6, SDA=PB9, 0x3c) via CFB, mostrando f0/modo/fps. Overlay + `CONFIG_DISPLAY/SSD1306/I2C/CHARACTER_FRAMEBUFFER`.
-- **Pinout confirmado (contra o board dts):** mic INMP441 no **I2S2** (CK=PB13, WS=PB12, SD=PB15, L/R=GND); OLED no **I2C1** (PB6/PB9). Obs: PB13 é do CAN2 no board → desabilitar `&can2` no overlay ao habilitar o I2S.
-- **F2 — Aquisição/afinador:** habilitar `&i2s2` (com `&can2 disabled`), clock PLLI2S e DMA RX; trocar o audio sintético pelo buffer real. Bom primeiro alvo: detector de nota por **autocorrelação** (afinador) antes da FFT completa.
+- **Pinout confirmado (contra o board dts):** mic INMP441 no **I2S2** (CK=PB13, WS=PB12, SD=PB15, L/R=GND); OLED no **I2C1** (PB6/PB9). Obs: PB13 é do CAN2 no board → `&can2` desabilitado no overlay.
+- ✅ **F2 (aquisição) concluída** — I2S2 + DMA capturando o INMP441 a 16 kHz, 24 bits corretos, 0 overruns. Ver §15.5.
+- **F3 — DSP/afinador:** detector de nota por **autocorrelação** (afinador: nota + cents) e depois FFT (CMSIS-DSP: `west config manifest.project-filter -- +cmsis-dsp`).
+
+### 15.5 Bugs encontrados na F2 (registro técnico)
+
+1. **Include errado de clock no overlay:** incluir `stm32_clock.h` (genérico) junto com `stm32f4_clock.h` faz `STM32_CLOCK_BUS_APB1` expandir para `0x2` em vez de `0x040` → `clock_control_on` escreve no registrador errado → `i2s_stm32_initialize: clock enabling failed: -5` e o device fica not-ready (`-ENODEV` no app). **Incluir apenas `stm32f4_clock.h`** (o mesmo que o SoC dtsi usa).
+2. **Amostras partidas em metades de 16 bits:** o registrador de dados do I2S no F4 é de 16 bits; em word_size 24/32 cada slot chega em duas metades, e o DMA (configurado em words de 32 pelo driver) grava **cada metade zero-estendida num word próprio**. Layout real por frame: `[Lhi, Llo, Rhi, Rlo]` (4 words). Sintomas: taxa 2×, padrão `[dado, dado, 0, 0]`, nível preso em 255. **Correção no app:** recombinar `((hi<<16)|lo) >> 8` → 24 bits com sinal (ver `acq_fft_thread`). Diagnóstico com o comando `rt dump` (amostras cruas) + analisador lógico (confirmou 24 bits no barramento).
 - **F2 — Aquisição:** nós de I2S do INMP441 + clock PLLI2S + canal de DMA RX no overlay (riscos R1–R3); trocar o `k_timer` que dá o semáforo pelo callback real do DMA no `acq_fft`.
 - **F3 — DSP:** habilitar CMSIS-DSP (`west config manifest.project-filter -- +cmsis-dsp`) e trocar o espectro sintético por janela de Hann + `arm_rfft_fast_f32` + `arm_cmplx_mag_f32`.

@@ -25,6 +25,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/i2s.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/sys/atomic.h>
@@ -42,6 +43,21 @@ LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
 #define N_BARS           32
 #define BLOCK_PERIOD_MS  ((FFT_SIZE * 1000) / SAMPLE_RATE_HZ)   /* ~32 ms */
 
+/* ===== Aquisicao I2S =====
+ * INMP441: 24 bits MSB-first num slot de 32 (canal esquerdo; L/R=GND).
+ * O registrador de dados do I2S no F4 e de 16 bits: cada slot chega em DUAS
+ * metades de 16 bits, e o DMA (configurado em words de 32) grava cada metade
+ * zero-estendida num word proprio. Layout real de um frame no buffer:
+ *   word0 = metade ALTA de L | word1 = metade BAIXA de L
+ *   word2 = metade alta de R | word3 = metade baixa de R (zero, mic so no L)
+ * A amostra e recombinada em software: ((hi<<16)|lo) >> 8 -> 24 bits com sinal.
+ */
+#define I2S_CHANNELS         2
+#define I2S_WORDS_PER_FRAME  4                 /* Lhi, Llo, Rhi, Rlo */
+#define I2S_BLOCK_BYTES      (FFT_SIZE * I2S_WORDS_PER_FRAME * 4)
+#define I2S_BLOCK_COUNT      3
+#define I2S_TIMEOUT_MS       2000
+
 /* ===== Modos de exibicao (plano, secao 8) ===== */
 enum disp_mode { MODE_SPECTRUM = 0, MODE_WAVE, MODE_STATS, MODE_COUNT };
 static const char *const mode_name[MODE_COUNT] = { "spectrum", "wave", "stats" };
@@ -55,8 +71,9 @@ struct spectrum_frame {
 };
 
 /* ===== Sincronizacao - nada de polling ===== */
-K_SEM_DEFINE(block_ready_sem, 0, 1);  /* "bloco novo do DMA" -> acq_fft */
-K_MSGQ_DEFINE(spectrum_msgq, sizeof(struct spectrum_frame), 4, 4); /* -> display */
+K_MSGQ_DEFINE(spectrum_msgq, sizeof(struct spectrum_frame), 4, 4); /* acq_fft -> display */
+/* buffers de DMA do I2S; o proprio i2s_read bloqueia ate o DMA entregar um bloco */
+K_MEM_SLAB_DEFINE_STATIC(i2s_rx_slab, I2S_BLOCK_BYTES, I2S_BLOCK_COUNT, 4);
 
 /* ===== Metricas de tempo real (lidas pelo shell `rt status`) ===== */
 static struct {
@@ -66,10 +83,17 @@ static struct {
 	uint32_t overruns;
 	uint32_t display_fps;
 	uint16_t dominant_hz;
+	uint32_t level;      /* nivel de audio (pico do bloco) */
+	bool     i2s_ok;     /* aquisicao I2S ativa */
+	int      i2s_err;    /* codigo de erro se a init do I2S falhar */
 } rt;
 
 /* ultimo frame "desenhado" pelo display; exibido sob demanda por 'rt watch' */
 static struct spectrum_frame g_latest;
+
+/* diagnostico da aquisicao I2S (comando 'rt dump') */
+static volatile int32_t  g_raw[8];        /* primeiros 4 frames crus (L,R,L,R,...) */
+static volatile uint32_t g_peak_l, g_peak_r;
 
 /* ===== LED e botao (aliases fornecidos pela board) ===== */
 static const struct gpio_dt_spec led    = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
@@ -79,24 +103,15 @@ static struct gpio_callback button_cb_data;
 /* display OLED (chosen zephyr,display -> ssd1306 no overlay) */
 static const struct device *const disp = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 
+/* microfone INMP441 no I2S2 (STM32 = mestre/controller, apenas RX) */
+static const struct device *const i2s_dev = DEVICE_DT_GET(DT_NODELABEL(i2s2));
+
 /* ---- blink: LED por k_timer (tarefa de referencia) ---- */
 static void blink_timer_cb(struct k_timer *t)
 {
 	gpio_pin_toggle_dt(&led);
 }
 K_TIMER_DEFINE(blink_timer, blink_timer_cb, NULL);
-
-/* ---- surrogato do callback de DMA do I2S: marca o ritmo dos blocos ----
- * TODO(F2): remover; quem dara o semaforo sera o dma callback real do I2S2.
- */
-static void block_timer_cb(struct k_timer *t)
-{
-	if (k_sem_count_get(&block_ready_sem) > 0) {
-		rt.overruns++;   /* acq_fft ainda nao consumiu o bloco anterior */
-	}
-	k_sem_give(&block_ready_sem);
-}
-K_TIMER_DEFINE(block_timer, block_timer_cb, NULL);
 
 /* ---- button: ISR enfileira work item (nada de logica pesada na ISR) ---- */
 static void mode_work_handler(struct k_work *w)
@@ -114,40 +129,108 @@ static void button_isr(const struct device *port, struct gpio_callback *cb,
 	k_work_submit(&mode_work);
 }
 
-/* ===== acq_fft (hard RT) - acorda no semaforo, processa, publica ===== */
+/* ===== acq_fft (hard RT) - le o I2S via DMA, processa e publica =====
+ * O i2s_read bloqueia ate o DMA entregar um bloco: e o proprio relogio
+ * hard RT da aquisicao (sem polling). */
 static void acq_fft_thread(void *a, void *b, void *c)
 {
+	const struct i2s_config cfg = {
+		.word_size = 32,
+		.channels = I2S_CHANNELS,
+		.format = I2S_FMT_DATA_FORMAT_I2S,
+		.options = I2S_OPT_BIT_CLK_CONTROLLER | I2S_OPT_FRAME_CLK_CONTROLLER,
+		.frame_clk_freq = SAMPLE_RATE_HZ,
+		.mem_slab = &i2s_rx_slab,
+		.block_size = I2S_BLOCK_BYTES,
+		.timeout = I2S_TIMEOUT_MS,
+	};
 	uint32_t seq = 0;
 
+	int rc;
+
+	if (!device_is_ready(i2s_dev)) {
+		rt.i2s_err = -ENODEV;
+		LOG_ERR("I2S2 device nao pronto");
+	} else if ((rc = i2s_configure(i2s_dev, I2S_DIR_RX, &cfg)) != 0) {
+		rt.i2s_err = rc;
+		LOG_ERR("i2s_configure falhou: %d", rc);
+	} else if ((rc = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START)) != 0) {
+		rt.i2s_err = rc;
+		LOG_ERR("i2s_trigger START falhou: %d", rc);
+	} else {
+		rt.i2s_ok = true;
+		LOG_INF("I2S2 (INMP441) capturando ~%d Hz", SAMPLE_RATE_HZ);
+	}
+
 	while (1) {
-		k_sem_take(&block_ready_sem, K_FOREVER);   /* bloqueia ate ter bloco */
+		void *block;
+		size_t nbytes;
+
+		if (!rt.i2s_ok) {
+			k_sleep(K_MSEC(500));   /* sem I2S: nao trava o resto do app */
+			continue;
+		}
+
+		int ret = i2s_read(i2s_dev, &block, &nbytes);  /* bloqueia ate ter bloco */
+
+		if (ret != 0) {
+			rt.overruns++;
+			LOG_WRN("i2s_read: %d", ret);
+			continue;
+		}
 
 		uint32_t t0 = k_cycle_get_32();
-		struct spectrum_frame f = { .seq = seq };
+		const uint32_t *s = block;
+		uint32_t frames = nbytes / (I2S_WORDS_PER_FRAME * 4);
+		int32_t pk_l = 0, pk_r = 0;
 
-		/* TODO(F2/F3): substituir pelo processamento real:
-		 *   1. ler buffer I2S do INMP441 (DMA ping-pong);
-		 *   2. janela de Hann (arm_mult_f32);
-		 *   3. arm_rfft_fast_f32 + arm_cmplx_mag_f32 (CMSIS-DSP);
-		 *   4. agrupar bins em N_BARS bandas (log) e converter para dB.
-		 * Por enquanto: espectro sintetico - um pico que varre as barras. */
-		uint32_t peak = (seq / 4) % N_BARS;
-		for (int i = 0; i < N_BARS; i++) {
-			int mag = 60 - abs((int)i - (int)peak) * 12;
+		/* TODO(F3): janela + FFT/autocorrelacao (CMSIS-DSP). Por ora mede o
+		 * pico dos dois canais e guarda amostras cruas p/ diagnostico ('rt dump'). */
+		for (uint32_t i = 0; i < frames; i++) {
+			const uint32_t *fr = &s[i * I2S_WORDS_PER_FRAME];
+			/* recombina as metades 16-bit e extrai 24 bits com sinal */
+			int32_t l = (int32_t)((fr[0] << 16) | (fr[1] & 0xFFFF)) >> 8;
+			int32_t r = (int32_t)((fr[2] << 16) | (fr[3] & 0xFFFF)) >> 8;
+			int32_t al = (l < 0) ? -l : l;
+			int32_t ar = (r < 0) ? -r : r;
 
-			f.bars[i] = (mag < 0) ? (1 + (i % 3)) : (uint8_t)mag;
+			if (al > pk_l) {
+				pk_l = al;
+			}
+			if (ar > pk_r) {
+				pk_r = ar;
+			}
 		}
-		f.dominant_hz = (uint16_t)((peak * SAMPLE_RATE_HZ) / FFT_SIZE);
+		for (int j = 0; j < 4; j++) {
+			const uint32_t *fr = &s[j * I2S_WORDS_PER_FRAME];
 
-		uint32_t dt = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
+			g_raw[2 * j]     = (int32_t)((fr[0] << 16) | (fr[1] & 0xFFFF)) >> 8;
+			g_raw[2 * j + 1] = (int32_t)((fr[2] << 16) | (fr[3] & 0xFFFF)) >> 8;
+		}
+		k_mem_slab_free(&i2s_rx_slab, block);
 
-		rt.fft_us_last = dt;
-		rt.fft_us_max  = MAX(rt.fft_us_max, dt);
-		rt.dominant_hz = f.dominant_hz;
+		g_peak_l = pk_l;
+		g_peak_r = pk_r;
+		int32_t peak = (pk_l > pk_r) ? pk_l : pk_r;
+
+		rt.level = (uint32_t)peak;
+
+		struct spectrum_frame f = { .seq = seq, .dominant_hz = 0 };
+		uint8_t h = peak >> 17;            /* escala grosseira p/ VU 0..63 */
+
+		if (h > 63) {
+			h = 63;
+		}
+		for (int i = 0; i < N_BARS; i++) {
+			f.bars[i] = h;
+		}
+
+		rt.fft_us_last = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
+		rt.fft_us_max = MAX(rt.fft_us_max, rt.fft_us_last);
 		rt.frames = ++seq;
 
-		/* publica sem bloquear o caminho hard RT; se a fila encher,
-		 * descarta o frame mais antigo (display e soft - pode perder). */
+		/* publica sem bloquear o caminho hard RT; se a fila encher, descarta o
+		 * frame mais antigo (display e soft - pode perder). */
 		if (k_msgq_put(&spectrum_msgq, &f, K_NO_WAIT) != 0) {
 			struct spectrum_frame drop;
 
@@ -205,7 +288,7 @@ static void display_thread(void *a, void *b, void *c)
 
 		cfb_framebuffer_clear(disp, false);
 		cfb_print(disp, "Analisador RT", 0, 0);
-		snprintf(line, sizeof(line), "f0: %5u Hz", f.dominant_hz);
+		snprintf(line, sizeof(line), "nivel: %u", rt.level);
 		cfb_print(disp, line, 0, 16);
 		snprintf(line, sizeof(line), "modo: %s",
 			 mode_name[atomic_get(&disp_mode)]);
@@ -226,9 +309,14 @@ static int cmd_rt_status(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "fft: ultimo=%u us  max=%u us", rt.fft_us_last,
 		    rt.fft_us_max);
 	shell_print(sh, "overruns=%u", rt.overruns);
+	shell_print(sh, "nivel(pico)=%u", rt.level);
 	shell_print(sh, "freq dominante=%u Hz", rt.dominant_hz);
 	shell_print(sh, "modo=%s", mode_name[atomic_get(&disp_mode)]);
-	shell_print(sh, "(acq_fft/display em modo stub - aguardando mic e OLED)");
+	if (rt.i2s_ok) {
+		shell_print(sh, "I2S=ok (deteccao de nota/FFT vem no passo 3)");
+	} else {
+		shell_print(sh, "I2S=OFF (erro=%d)", rt.i2s_err);
+	}
 	return 0;
 }
 
@@ -284,6 +372,17 @@ static int cmd_rt_watch(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_rt_dump(const struct shell *sh, size_t argc, char **argv)
+{
+	shell_print(sh, "pico canal L=%u  R=%u  (I2S=%s)", g_peak_l, g_peak_r,
+		    rt.i2s_ok ? "ok" : "OFF");
+	shell_print(sh, "amostras recombinadas (4 frames, 24-bit com sinal):");
+	for (int j = 0; j < 8; j += 2) {
+		shell_print(sh, "  L=%8d  R=%8d", (int)g_raw[j], (int)g_raw[j + 1]);
+	}
+	return 0;
+}
+
 static int cmd_rt_help(const struct shell *sh, size_t argc, char **argv)
 {
 	shell_print(sh, "Analisador de espectro - comandos:");
@@ -303,6 +402,7 @@ static int cmd_rt_help(const struct shell *sh, size_t argc, char **argv)
 SHELL_STATIC_SUBCMD_SET_CREATE(rt_sub,
 	SHELL_CMD(help, NULL, "Lista os comandos do analisador e o que fazem", cmd_rt_help),
 	SHELL_CMD(status, NULL, "Metricas de tempo real", cmd_rt_status),
+	SHELL_CMD(dump, NULL, "Amostras cruas do I2S (diagnostico)", cmd_rt_dump),
 	SHELL_CMD_ARG(watch, NULL, "Espectro ao vivo por N segundos: rt watch [s]",
 		      cmd_rt_watch, 1, 1),
 	SHELL_CMD_ARG(mode, NULL, "Troca o modo: rt mode <spectrum|wave|stats>",
@@ -328,10 +428,8 @@ int main(void)
 	}
 
 	k_timer_start(&blink_timer, K_MSEC(500), K_MSEC(500));            /* LED 1 Hz */
-	k_timer_start(&block_timer, K_MSEC(BLOCK_PERIOD_MS),
-		      K_MSEC(BLOCK_PERIOD_MS));
 
-	LOG_INF("analisador de espectro - esqueleto RT (F0): Fs=%d N=%d bloco=%d ms",
+	LOG_INF("analisador de espectro (F2 - aquisicao I2S): Fs=%d N=%d bloco=%d ms",
 		SAMPLE_RATE_HZ, FFT_SIZE, BLOCK_PERIOD_MS);
 	LOG_INF("shell pronto. Digite 'rt help' para ver os comandos disponiveis.");
 	return 0;
