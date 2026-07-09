@@ -49,7 +49,8 @@ LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
  * O DMA entrega um bloco a cada T_bloco, queira a CPU ou nao; todo o
  * processamento (FFT + autocorrelacao) tem que caber nesse periodo, senao
  * os I2S_BLOCK_COUNT buffers do slab esgotam e ha overrun (amostra perdida).
- * Medido na placa: proc max ~18,4 ms -> margem ~42% do deadline. */
+ * Medido na placa (ACF escalar, antes do arm_dot_prod_f32): proc max
+ * ~18,4 ms -> margem ~42% do deadline; re-medir com `rt jitter`. */
 #define BLOCK_PERIOD_MS  ((FFT_SIZE * 1000) / SAMPLE_RATE_HZ)   /* ~32 ms */
 
 /* ===== Aquisicao I2S =====
@@ -212,6 +213,15 @@ K_WORK_DEFINE(mode_work, mode_work_handler);
 static void button_isr(const struct device *port, struct gpio_callback *cb,
 		       uint32_t pins)
 {
+	/* debounce: o repique mecanico gera varias bordas por toque; ignora
+	 * eventos a menos de 200 ms do ultimo aceito */
+	static uint32_t last_ms;
+	uint32_t now = k_uptime_get_32();
+
+	if (now - last_ms < 200U) {
+		return;
+	}
+	last_ms = now;
 	k_work_submit(&mode_work);
 }
 
@@ -236,35 +246,28 @@ static float tuner_detect(void)
 	memcpy(&x[TUNER_WIN - p], tuner_ring, p * sizeof(float));
 
 	/* remove DC */
-	float mean = 0.0f;
+	float mean;
 
-	for (int i = 0; i < TUNER_WIN; i++) {
-		mean += x[i];
-	}
-	mean /= TUNER_WIN;
-	for (int i = 0; i < TUNER_WIN; i++) {
-		x[i] -= mean;
-	}
+	arm_mean_f32(x, TUNER_WIN, &mean);
+	arm_offset_f32(x, -mean, x, TUNER_WIN);
 
 	/* energia (lag 0) */
-	float r0 = 0.0f;
+	float r0;
 
-	for (int i = 0; i < TUNER_WIN; i++) {
-		r0 += x[i] * x[i];
-	}
+	arm_power_f32(x, TUNER_WIN, &r0);
 	if (r0 < 1.0f) {
 		return 0.0f;
 	}
 
-	/* autocorrelacao nos lags de interesse */
+	/* autocorrelacao nos lags de interesse; e o passo dominante do custo
+	 * (O(WIN x LAGS) MACs), por isso o produto interno fica com o CMSIS-DSP
+	 * (arm_dot_prod_f32, unroll otimizado p/ o M4F) */
 	float rmax = 0.0f;
 
 	for (int lag = TUNER_LAG_MIN; lag <= TUNER_LAG_MAX; lag++) {
-		float acc = 0.0f;
+		float acc;
 
-		for (int i = 0; i < TUNER_WIN - lag; i++) {
-			acc += x[i] * x[i + lag];
-		}
+		arm_dot_prod_f32(x, &x[lag], TUNER_WIN - lag, &acc);
 		acf[lag] = acc;
 		if (acc > rmax) {
 			rmax = acc;
@@ -514,7 +517,8 @@ static void acq_fft_thread(void *a, void *b, void *c)
 
 		/* tempo de processamento do bloco (recombinacao + FFT + ACF).
 		 * Condicao de escalonabilidade: fft_us_max < BLOCK_PERIOD_NOM_US
-		 * (31922 us); medido ~18,4 ms no pior caso -> 42% de margem */
+		 * (31922 us); pior caso medido com ACF escalar era ~18,4 ms
+		 * (42% de margem) - com arm_dot_prod_f32 deve cair bem abaixo */
 		rt.fft_us_last = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
 		rt.fft_us_max = MAX(rt.fft_us_max, rt.fft_us_last);
 		rt.frames = ++seq;
