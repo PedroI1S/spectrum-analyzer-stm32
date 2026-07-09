@@ -7,7 +7,7 @@ completo está em [`plano_projeto_analisador_espectro_zephyr.md`](plano_projeto_
 > Este repositório partiu do template **Zephyr example-application**; a documentação
 > original do template está preservada [mais abaixo](#zephyr-example-application-template-original).
 
-## Estado atual (bring-up — atualizado em 27/06/2026)
+## Estado atual (bring-up — atualizado em 09/07/2026)
 
 - ✅ Ambiente Zephyr montado: venv (`.venv/`), `west`, Zephyr `main` + módulos
   (`cmsis_6`, `hal_stm32`, `hal_nordic`, `segger`) e toolchain `arm-zephyr-eabi`.
@@ -39,6 +39,19 @@ completo está em [`plano_projeto_analisador_espectro_zephyr.md`](plano_projeto_
   de folga. Taxa de amostragem gerada por hardware (I2S/PLLI2S) + DMA → jitter de amostragem nulo.
 - **Projeto funcionalmente completo** (F0–F6). Checklist do enunciado: ☑ em todos os itens (§13 do plano).
   Resta apenas o vídeo de demonstração.
+
+## Branches
+
+- **`main`** — versão estável, validada na placa (estado da entrega). Não recebe
+  commit direto: mudanças chegam via merge/PR a partir da `develop`.
+- **`develop`** — melhorias pós-entrega em andamento:
+  - *debounce* do botão de modo (ignora bordas a menos de 200 ms — o repique
+    mecânico trocava mais de um modo por toque);
+  - autocorrelação do afinador reescrita com CMSIS-DSP (`arm_dot_prod_f32` no
+    produto interno + `arm_mean_f32`/`arm_offset_f32`/`arm_power_f32`), exigindo
+    `CONFIG_CMSIS_DSP_BASICMATH=y` e `CONFIG_CMSIS_DSP_STATISTICS=y` no `prj.conf`.
+    Pendente: re-medir o tempo de processamento na placa (`rt jitter` / `rt status`
+    — o pior caso de ~18,4 ms foi medido com a versão escalar).
 
 ## Como construir, gravar e ver o console
 
