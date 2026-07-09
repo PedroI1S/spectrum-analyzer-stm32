@@ -2,24 +2,25 @@
  * Copyright (c) 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Analisador de espectro de audio - esqueleto de tempo real (fase F0).
+ * Analisador de espectro de audio / afinador em tempo real (F0-F6 completas).
  *
- * Implementa a arquitetura de tarefas do plano (secao 4), com toda a
- * sincronizacao por objetos do Zephyr (sem polling no codigo de aplicacao):
+ * Captura audio do microfone I2S (INMP441, 16 kHz, 24 bits, DMA), processa
+ * cada bloco (FFT do espectro via CMSIS-DSP + deteccao de pitch por
+ * autocorrelacao) e exibe no OLED SSD1306. Arquitetura de tarefas do plano
+ * (secao 4), com toda a sincronizacao por objetos do Zephyr (sem polling no
+ * codigo de aplicacao):
  *
- *   acq_fft  (hard RT) - acorda por semaforo, processa um bloco e publica o
- *                        espectro numa message queue. O semaforo e dado, por
- *                        ora, por um k_timer que simula o callback de meia
- *                        transferencia do DMA do I2S (substituir na fase F2).
- *   display  (soft RT) - bloqueia na message queue e "desenha" o ultimo frame.
- *                        Sem o OLED, imprime um resumo no console (fase F1/F4
- *                        trocam isso pelo driver SSD1306).
+ *   acq_fft  (hard RT, prio 2) - dorme em i2s_read(): o DMA do I2S e o
+ *                        proprio relogio da tarefa (1 bloco = 512 amostras =
+ *                        ~32 ms = deadline). Recombina as amostras, calcula
+ *                        pico + FFT + autocorrelacao e publica um frame na
+ *                        message queue (K_NO_WAIT, descarta o mais antigo).
+ *   display  (soft RT, prio 7) - bloqueia na message queue e desenha o ultimo
+ *                        frame no OLED (modos: tuner|spectrum|wave|stats).
  *   blink              - k_timer pisca o LED de usuario (referencia visual).
  *   button             - IRQ de GPIO -> work item troca o modo de exibicao.
- *   shell              - subsistema shell: `kernel threads` e comandos `rt`.
- *
- * Os trechos marcados com TODO(Fx) sao os pontos onde entram I2S/CMSIS-DSP/OLED
- * quando o circuito estiver montado.
+ *   shell (RTT)        - comandos `rt ...` (status/tune/jitter/watch/...) e
+ *                        `kernel ...` para inspecao das threads.
  */
 
 #include <zephyr/kernel.h>
@@ -43,6 +44,12 @@ LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
 #define SAMPLE_RATE_HZ   16000
 #define FFT_SIZE         512
 #define N_BARS           32
+/* Periodo do bloco = deadline hard RT da acq_fft:
+ *   T_bloco = FFT_SIZE / Fs = 512 / 16000 = 32 ms (nominal)
+ * O DMA entrega um bloco a cada T_bloco, queira a CPU ou nao; todo o
+ * processamento (FFT + autocorrelacao) tem que caber nesse periodo, senao
+ * os I2S_BLOCK_COUNT buffers do slab esgotam e ha overrun (amostra perdida).
+ * Medido na placa: proc max ~18,4 ms -> margem ~42% do deadline. */
 #define BLOCK_PERIOD_MS  ((FFT_SIZE * 1000) / SAMPLE_RATE_HZ)   /* ~32 ms */
 
 /* ===== Aquisicao I2S =====
@@ -56,6 +63,9 @@ LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
  */
 #define I2S_CHANNELS         2
 #define I2S_WORDS_PER_FRAME  4                 /* Lhi, Llo, Rhi, Rlo */
+/* 1 bloco = 512 frames x 4 words x 4 B = 8192 B = 512 amostras = 1 periodo
+ * de ~32 ms; 3 blocos no slab = 24 KiB de RAM e ate ~2 periodos de folga
+ * para a aplicacao devolver blocos antes de faltar buffer pro DMA. */
 #define I2S_BLOCK_BYTES      (FFT_SIZE * I2S_WORDS_PER_FRAME * 4)
 #define I2S_BLOCK_COUNT      3
 #define I2S_TIMEOUT_MS       2000
@@ -66,14 +76,17 @@ LOG_MODULE_REGISTER(spectrum, LOG_LEVEL_INF);
  * Usar a Fs nominal (16000) daria um erro sistematico de ~4 cents.
  */
 #define FS_ACTUAL_HZ     16039.3f
-#define TUNER_WIN        1024     /* 64 ms de sinal (>5 periodos do E2 = 82 Hz);
-				   * janela maior (2048) estourava o deadline do
-				   * bloco: ACF media ~43 ms > 32 ms */
-#define TUNER_LAG_MIN    6        /* teto ~2670 Hz; com 12 o teto era 1337 Hz e
-				   * notas na borda (ex.: E6=1318 Hz) caiam uma
-				   * oitava: o pico real ficava fora da busca e
-				   * o detector pegava o de 2x o periodo */
-#define TUNER_LAG_MAX    400      /* piso ~40 Hz */
+#define TUNER_WIN        1024     /* janela = 1024 / 16039,3 Hz = 63,8 ms de
+				   * sinal (>5 periodos do E2: T = 1/82 Hz =
+				   * 12,2 ms). Janela maior (2048) estourava o
+				   * deadline do bloco: ACF media ~43 ms > 32 ms
+				   * (custo O(WIN x LAGS) ~4x o da atual) */
+#define TUNER_LAG_MIN    6        /* teto = Fs/6 = 16039,3/6 = ~2673 Hz; com 12
+				   * o teto era 1337 Hz e notas na borda (ex.:
+				   * E6=1318 Hz) caiam uma oitava: o pico real
+				   * ficava fora da busca e o detector pegava o
+				   * de 2x o periodo */
+#define TUNER_LAG_MAX    400      /* piso = Fs/400 = ~40 Hz (abaixo do E2) */
 
 /* sensibilidade do afinador (rt sens <alta|media|baixa>):
  * gate  = pico 24-bit minimo p/ tentar detectar (menor = pega som mais fraco)
@@ -94,6 +107,9 @@ static const char *const note_names[12] = {
 };
 
 /* ===== Espectro (FFT real de 512 pontos, CMSIS-DSP) =====
+ * Resolucao espectral: df = Fs_real / FFT_SIZE = 16039,3 / 512 = 31,3 Hz/bin.
+ * Bins uteis 1..255 -> de 31 Hz ate Nyquist (Fs/2 = ~8 kHz); o bin k
+ * representa f = k * Fs_real / FFT_SIZE.
  * Magnitudes em dB mapeadas para barras de 0..63; bandas em progressao
  * geometrica (log) - audio e logaritmico nos dois eixos. */
 #define SPEC_BINS      (FFT_SIZE / 2)
@@ -144,6 +160,10 @@ static struct {
 	uint32_t per_n;
 } rt;
 
+/* Periodo nominal com a Fs REAL do hardware (nao a de projeto):
+ *   T = FFT_SIZE / Fs_real = 512 / 16039,3 Hz = 31922 us
+ * (vs 32000 us com a Fs nominal de 16 kHz). E contra ESTE valor que o
+ * jitter e o deadline sao comparados em `rt jitter`. */
 #define BLOCK_PERIOD_NOM_US 31922U
 
 static void jitter_reset(void)
@@ -492,6 +512,9 @@ static void acq_fft_thread(void *a, void *b, void *c)
 					     : spec_dom_hz;
 		rt.dominant_hz = f.dominant_hz;
 
+		/* tempo de processamento do bloco (recombinacao + FFT + ACF).
+		 * Condicao de escalonabilidade: fft_us_max < BLOCK_PERIOD_NOM_US
+		 * (31922 us); medido ~18,4 ms no pior caso -> 42% de margem */
 		rt.fft_us_last = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
 		rt.fft_us_max = MAX(rt.fft_us_max, rt.fft_us_last);
 		rt.frames = ++seq;
@@ -523,7 +546,7 @@ static void display_thread(void *a, void *b, void *c)
 		cfb_framebuffer_set_font(disp, 0);
 		cfb_framebuffer_clear(disp, true);
 		cfb_print(disp, "Analisador RT", 0, 0);
-		cfb_print(disp, "F1: OLED ok", 0, 16);
+		cfb_print(disp, "OLED ok", 0, 16);
 		cfb_framebuffer_finalize(disp);
 		have_disp = true;
 		LOG_INF("OLED SSD1306 pronto (I2C1 @ 0x3c)");
@@ -544,7 +567,10 @@ static void display_thread(void *a, void *b, void *c)
 		}
 		g_latest = f;
 
-		/* desenha a ~20 fps (I2C fast a 400 kHz aguenta ~30 fps) */
+		/* desenha a cada 50 ms -> 20 fps (soft RT). Custo de 1 frame
+		 * no I2C: 128x64/8 = 1024 B de framebuffer ~ 10 kbit + ACKs
+		 * @ 400 kHz ~ 26-30 ms -> teto fisico ~30 fps; 20 fps deixa
+		 * folga p/ o barramento (compartilhado com o codec) */
 		if (!have_disp || now - last_draw < 50) {
 			continue;
 		}
@@ -584,9 +610,11 @@ static void display_thread(void *a, void *b, void *c)
 				}
 			}
 		} else if (m == MODE_WAVE) {
-			/* mini-osciloscopio: 16 ms de sinal (256 amostras, 2 por
-			 * coluna), gatilho por cruzamento de zero (estabiliza a
-			 * onda) e ganho vertical automatico pelo pico recente */
+			/* mini-osciloscopio: 256 amostras / 16039,3 Hz = 16 ms
+			 * de sinal (2 amostras por coluna de pixel; cobre ~1,3
+			 * periodo do E2 e ~37 do A4), gatilho por cruzamento de
+			 * zero (estabiliza a onda) e ganho vertical automatico
+			 * pelo pico recente */
 			uint32_t base = (tuner_pos - 256 - 128) & (TUNER_WIN - 1);
 			uint32_t trig = 0;
 
@@ -819,8 +847,8 @@ static int cmd_rt_help(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "  rt help        esta ajuda");
 	shell_print(sh, "");
 	shell_print(sh, "Uteis do Zephyr:");
-	shell_print(sh, "  kernel thread list   threads: prioridade, estado, uso de pilha");
-	shell_print(sh, "  kernel stacks        uso de pilha por thread");
+	shell_print(sh, "  kernel thread list    threads: prioridade, estado, uso de pilha");
+	shell_print(sh, "  kernel thread stacks  uso de pilha por thread (marca d'agua)");
 	shell_print(sh, "  kernel uptime        tempo desde o boot");
 	shell_print(sh, "  help                 lista todos os comandos do shell");
 	return 0;
@@ -837,7 +865,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(rt_sub,
 	SHELL_CMD(dump, NULL, "Amostras cruas do I2S (diagnostico)", cmd_rt_dump),
 	SHELL_CMD_ARG(watch, NULL, "Espectro ao vivo por N segundos: rt watch [s]",
 		      cmd_rt_watch, 1, 1),
-	SHELL_CMD_ARG(mode, NULL, "Troca o modo: rt mode <spectrum|wave|stats>",
+	SHELL_CMD_ARG(mode, NULL, "Troca o modo: rt mode <tuner|spectrum|wave|stats>",
 		      cmd_rt_mode, 2, 0),
 	SHELL_SUBCMD_SET_END);
 SHELL_CMD_REGISTER(rt, &rt_sub, "Comandos do analisador de espectro", NULL);
@@ -861,7 +889,7 @@ int main(void)
 
 	k_timer_start(&blink_timer, K_MSEC(500), K_MSEC(500));            /* LED 1 Hz */
 
-	LOG_INF("analisador de espectro (F2 - aquisicao I2S): Fs=%d N=%d bloco=%d ms",
+	LOG_INF("analisador de espectro / afinador: Fs=%d N=%d bloco=%d ms",
 		SAMPLE_RATE_HZ, FFT_SIZE, BLOCK_PERIOD_MS);
 	LOG_INF("shell pronto. Digite 'rt help' para ver os comandos disponiveis.");
 	return 0;
